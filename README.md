@@ -474,3 +474,10 @@ We take the core idea of treating characters as rendering primitives with spatia
 
 AGPL. If you (a third party) wish to incorporate or redistribute this software (including without limitation a SaaS product), you must reach out to negotiate a commercial license.
 
+## Thanks
+
+This project is sponsored by [Zellic](https://zellic.io). We do the best security reviews in the world
+
+<img height="128px" alt="RGB_zellic-logo-primary-dark" src="https://github.com/user-attachments/assets/acdd091f-aa84-4dc9-a53f-d24fa0059c52" />
+
+If you're smart, like working on interesting problems, and want to work with the best hackers in the world, [we're hiring](https://zellic.io/jobs).

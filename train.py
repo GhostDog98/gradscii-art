@@ -132,6 +132,79 @@ def load_target_image(image_path):
     return img_tensor
 
 
+def apply_transform(image, tx, ty, scale_x, scale_y):
+    """
+    Apply spatial transformation (translation + scaling) using manual bilinear interpolation.
+    MPS doesn't support grid_sample backward, so we implement it manually.
+
+    Args:
+        image: (H, W) tensor
+        tx: horizontal translation in pixels (positive = shift right)
+        ty: vertical translation in pixels (positive = shift down)
+        scale_x: horizontal scale factor (1.0 = no scaling, <1.0 = downscale)
+        scale_y: vertical scale factor (1.0 = no scaling, <1.0 = downscale)
+
+    Returns:
+        transformed: (H, W) transformed image
+    """
+    H, W = image.shape
+
+    # Centers for scaling
+    center_y = (H - 1) / 2.0
+    center_x = (W - 1) / 2.0
+
+    # Create coordinate grids for output pixels
+    y_out = torch.arange(H, device=DEVICE, dtype=torch.float32).view(-1, 1)
+    x_out = torch.arange(W, device=DEVICE, dtype=torch.float32).view(1, -1)
+
+    # Apply inverse transformation to find source coordinates
+    # For each output pixel, compute where to sample from in the input
+    # Scale from center, then translate
+    y_coords = (y_out - center_y) / scale_y + center_y - ty
+    x_coords = (x_out - center_x) / scale_x + center_x - tx
+
+    # Get integer coordinates for 4 neighbors
+    y0 = torch.floor(y_coords).long()
+    y1 = y0 + 1
+    x0 = torch.floor(x_coords).long()
+    x1 = x0 + 1
+
+    # Compute interpolation weights
+    wy1 = y_coords - y0.float()
+    wy0 = 1.0 - wy1
+    wx1 = x_coords - x0.float()
+    wx0 = 1.0 - wx1
+
+    # Create masks for valid coordinates (within bounds)
+    valid_y0 = (y0 >= 0) & (y0 < H)
+    valid_y1 = (y1 >= 0) & (y1 < H)
+    valid_x0 = (x0 >= 0) & (x0 < W)
+    valid_x1 = (x1 >= 0) & (x1 < W)
+
+    # Clamp coordinates for safe indexing (but track validity separately)
+    y0_safe = torch.clamp(y0, 0, H - 1)
+    y1_safe = torch.clamp(y1, 0, H - 1)
+    x0_safe = torch.clamp(x0, 0, W - 1)
+    x1_safe = torch.clamp(x1, 0, W - 1)
+
+    # Gather 4 neighbors with validity masks
+    # If coordinate is out of bounds, use white (1.0) instead
+    val_00 = torch.where(valid_y0 & valid_x0, image[y0_safe, x0_safe], torch.ones_like(image[0, 0]))
+    val_01 = torch.where(valid_y0 & valid_x1, image[y0_safe, x1_safe], torch.ones_like(image[0, 0]))
+    val_10 = torch.where(valid_y1 & valid_x0, image[y1_safe, x0_safe], torch.ones_like(image[0, 0]))
+    val_11 = torch.where(valid_y1 & valid_x1, image[y1_safe, x1_safe], torch.ones_like(image[0, 0]))
+
+    # Bilinear interpolation
+    transformed = (
+        val_00 * wy0 * wx0 +
+        val_01 * wy0 * wx1 +
+        val_10 * wy1 * wx0 +
+        val_11 * wy1 * wx1
+    )
+
+    return transformed
+
+
 def render_ascii(logits, char_bitmaps, temperature=1.0, use_gumbel=False):
     """
     Render ASCII art using soft character selection (vectorized).
@@ -187,8 +260,9 @@ def render_ascii(logits, char_bitmaps, temperature=1.0, use_gumbel=False):
 
 
 def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interval=100, warmup_iterations=50, diversity_weight=0.01,
-          use_gumbel=True, temp_start=1.0, temp_end=0.01, protect_whitespace=True, multiscale_weight=0.0, multiscale_kernel=4):
-    """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, multiscale perceptual loss, and Gumbel-softmax."""
+          use_gumbel=True, temp_start=1.0, temp_end=0.01, protect_whitespace=True, multiscale_weight=0.0, multiscale_kernel=4,
+          optimize_alignment=False, alignment_lr=0.01):
+    """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, multiscale perceptual loss, learnable spatial alignment, and Gumbel-softmax."""
 
     # Clear and create steps directory
     if os.path.exists("steps"):
@@ -200,8 +274,23 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         torch.randn(GRID_HEIGHT, GRID_WIDTH, NUM_CHARS, device=DEVICE) * 0.01
     )
 
-    # Optimizer
-    optimizer = optim.AdamW([logits], lr=lr)
+    # Learnable spatial transformation (translation + scaling)
+    if optimize_alignment:
+        translation_x = nn.Parameter(torch.zeros(1, device=DEVICE))
+        translation_y = nn.Parameter(torch.zeros(1, device=DEVICE))
+        # Unconstrained parameters for scale (will be mapped via sigmoid to [0.75, 1.25])
+        scale_x_param = nn.Parameter(torch.zeros(1, device=DEVICE))  # 0 maps to 1.0 after sigmoid
+        scale_y_param = nn.Parameter(torch.zeros(1, device=DEVICE))
+        optimizer = optim.AdamW([
+            {'params': [logits], 'lr': lr},
+            {'params': [translation_x, translation_y, scale_x_param, scale_y_param], 'lr': alignment_lr}
+        ])
+    else:
+        translation_x = None
+        translation_y = None
+        scale_x_param = None
+        scale_y_param = None
+        optimizer = optim.AdamW([logits], lr=lr)
 
     # Cosine annealing scheduler with warmup
     def get_lr_multiplier(iteration):
@@ -220,6 +309,9 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
 
     print(f"\nTraining for {num_iterations} iterations with warmup={warmup_iterations}")
     print(f"Gumbel-softmax: {use_gumbel}, Temperature: {temp_start} -> {temp_end}")
+    if optimize_alignment:
+        print(f"Spatial alignment: Enabled (translate ±{CHAR_WIDTH/2:.1f}px H / ±{CHAR_HEIGHT/2:.1f}px V, scale 0.75-1.25x)")
+        print(f"  Alignment frozen during warmup, active after iteration {warmup_iterations}")
 
     pbar = tqdm(range(num_iterations))
     for iteration in pbar:
@@ -238,14 +330,30 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         # Render current ASCII art with Gumbel-softmax
         rendered = render_ascii(logits, char_bitmaps, temperature=temperature, use_gumbel=use_gumbel)
 
+        # Apply learnable spatial transformation to target if enabled
+        if optimize_alignment:
+            # Map unconstrained translation params to ±50% of character cell via tanh
+            # tanh(0) = 0 -> no translation at initialization
+            tx = (CHAR_WIDTH / 2) * torch.tanh(translation_x)
+            ty = (CHAR_HEIGHT / 2) * torch.tanh(translation_y)
+            # Map unconstrained scale params to [0.75, 1.25] via sigmoid
+            # sigmoid(0) = 0.5 -> maps to 1.0 (no scaling)
+            sx = 0.75 + 0.5 * torch.sigmoid(scale_x_param)
+            sy = 0.75 + 0.5 * torch.sigmoid(scale_y_param)
+
+            # Apply transformation using manual bilinear interpolation
+            target_shifted = apply_transform(target_image, tx, ty, sx, sy)
+        else:
+            target_shifted = target_image
+
         # Compute reconstruction loss
-        recon_loss = criterion(rendered, target_image)
+        recon_loss = criterion(rendered, target_shifted)
 
         # Compute multiscale perceptual loss (dithering effect)
         if multiscale_weight != 0.0:
             # Add batch and channel dimensions for pooling
             rendered_4d = rendered.unsqueeze(0).unsqueeze(0)
-            target_4d = target_image.unsqueeze(0).unsqueeze(0)
+            target_4d = target_shifted.unsqueeze(0).unsqueeze(0)
 
             # Downsample both rendered and target with overlapping patches
             # Use stride = kernel_size // 2 for 50% overlap
@@ -287,6 +395,7 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
 
         # Backprop
         loss.backward()
+
         optimizer.step()
         scheduler.step()
 
@@ -300,6 +409,11 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
             postfix['ms'] = f'{multiscale_loss.item():.4f}'
         if diversity_weight != 0.0:
             postfix['div'] = f'{diversity_loss.item():.4f}'
+        if optimize_alignment:
+            postfix['tx'] = f'{tx.item():.1f}'
+            postfix['ty'] = f'{ty.item():.1f}'
+            postfix['sx'] = f'{sx.item():.3f}'
+            postfix['sy'] = f'{sy.item():.3f}'
         pbar.set_postfix(postfix)
 
         # Save intermediate results
@@ -309,13 +423,17 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
                 char_bitmaps,
                 output_path=f"steps/i_iter_{iteration:04d}.png",
                 text_path=f"steps/t_iter_{iteration:04d}.txt",
-                temperature=temperature
+                temperature=temperature,
+                target_image=target_shifted if optimize_alignment else None
             )
 
-    return logits
+    if optimize_alignment:
+        return logits, translation_x.item(), translation_y.item(), target_shifted
+    else:
+        return logits
 
 
-def save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", utf8_path="", temperature=0.1):
+def save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", utf8_path="", temperature=0.1, target_image=None):
     """Save the final ASCII art as image and text."""
     # Get discrete character selection for text file
     char_indices = torch.argmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH) - keep on device
@@ -337,6 +455,13 @@ def save_result(logits, char_bitmaps, output_path="output.png", text_path="outpu
 
     # Save as image
     img_array = (rendered.detach().cpu().numpy() * 255).astype(np.uint8)
+
+    # If target image provided, show side by side
+    if target_image is not None:
+        target_array = (target_image.detach().cpu().numpy() * 255).astype(np.uint8)
+        # Horizontally concatenate: rendered | target
+        img_array = np.hstack([img_array, target_array])
+
     img = Image.fromarray(img_array, mode='L')
     img.save(output_path)
 
@@ -458,6 +583,10 @@ Examples:
                        help='Weight for multiscale perceptual loss (dithering effect) - optimizes for how it looks when downsampled (default: 0.5, try 0.0-1.0)')
     parser.add_argument('--multiscale-kernel', type=int, default=4,
                        help='Downsampling kernel size for multiscale loss (default: 4, simulates viewing distance)')
+    parser.add_argument('--optimize-alignment', action='store_true', default=True,
+                       help='Learn spatial translation to align image with character grid (±50%% of character cell)')
+    parser.add_argument('--alignment-lr', type=float, default=0.1,
+                       help='Learning rate for spatial alignment (default: 0.1)')
 
     # Gumbel-softmax parameters
     parser.add_argument('--no-gumbel', action='store_true',
@@ -567,6 +696,7 @@ if __name__ == "__main__":
     print(f"  Warmup:         {args.warmup} iterations")
     print(f"  Diversity:      {args.diversity_weight} (whitespace {'protected' if not args.penalize_whitespace else 'included'})")
     print(f"  Multiscale:     {args.multiscale_weight} (kernel={args.multiscale_kernel})")
+    print(f"  Alignment:      {'Enabled' if args.optimize_alignment else 'Disabled'}" + (f" (lr={args.alignment_lr})" if args.optimize_alignment else ""))
     print(f"  Gumbel-softmax: {'Enabled' if not args.no_gumbel else 'Disabled'}")
     if not args.no_gumbel:
         print(f"    Temperature:  {args.temp_start} → {args.temp_end}")
@@ -589,7 +719,7 @@ if __name__ == "__main__":
     char_bitmaps = create_char_bitmaps()
     target_image = load_target_image(args.input_image)
 
-    logits = train(
+    result = train(
         target_image, char_bitmaps,
         num_iterations=args.iterations,
         lr=args.lr,
@@ -601,15 +731,28 @@ if __name__ == "__main__":
         temp_end=args.temp_end,
         protect_whitespace=not args.penalize_whitespace,
         multiscale_weight=args.multiscale_weight,
-        multiscale_kernel=args.multiscale_kernel
+        multiscale_kernel=args.multiscale_kernel,
+        optimize_alignment=args.optimize_alignment,
+        alignment_lr=args.alignment_lr
     )
+
+    if args.optimize_alignment:
+        logits, tx_param, ty_param, target_shifted = result
+        # Compute actual transformed values from parameters
+        tx = (CHAR_WIDTH / 2) * np.tanh(tx_param)
+        ty = (CHAR_HEIGHT / 2) * np.tanh(ty_param)
+        print(f"\nLearned spatial translation: x={tx:.2f}px, y={ty:.2f}px")
+    else:
+        logits = result
+        target_shifted = None
 
     save_result(
         logits, char_bitmaps,
         output_path=args.output,
         text_path=args.output_text,
         utf8_path=args.output_utf8,
-        temperature=args.save_temp
+        temperature=args.save_temp,
+        target_image=target_shifted
     )
 
     print("\nDone!")

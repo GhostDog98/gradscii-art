@@ -38,12 +38,12 @@ else:
     CHARS = ''.join(chr(i) for i in range(32, 127))
 
 # Ban certain characters (block characters that feel like cheating)
-BANNED_CHARS = ['█', '▄', '▌', '▐', '▀', '■']
+BANNED_CHARS = ['░', '▒', '▓', '█', '▄', '▌', '▐', '▀', '■']
 CHARS = ''.join(c for c in CHARS if c not in BANNED_CHARS)
 
 NUM_CHARS = len(CHARS)
 
-print(f"Using {NUM_CHARS} characters ({ENCODING}): {CHARS[:20]}...")
+print(f"Using {NUM_CHARS} characters ({ENCODING}): {CHARS}")
 
 
 def create_char_bitmaps():
@@ -132,25 +132,37 @@ def load_target_image(image_path):
         img_array = np.pad(img_array, ((pad_top, pad_bottom), (0, 0)), mode='constant', constant_values=1.0)  # White padding
 
     # Convert to tensor
-    img_tensor = torch.tensor(img_array, dtype=torch.float32).to(DEVICE)
+    img_tensor = torch.tensor(img_array, dtype=torch.float32, device=DEVICE)
 
     print(f"Target image shape: {img_tensor.shape}")
     return img_tensor
 
 
-def render_ascii(logits, char_bitmaps):
+def render_ascii(logits, char_bitmaps, temperature=1.0, use_gumbel=False):
     """
     Render ASCII art using soft character selection (vectorized).
 
     Args:
         logits: (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS) - unnormalized scores
         char_bitmaps: (NUM_CHARS, CHAR_HEIGHT, CHAR_WIDTH) - character bitmaps
+        temperature: Temperature for softmax (lower = more discrete)
+        use_gumbel: Whether to add Gumbel noise
 
     Returns:
         rendered: (IMAGE_HEIGHT, IMAGE_WIDTH) - rendered image with row gaps
     """
-    # Apply softmax to get character weights
-    weights = torch.softmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
+    # Apply Gumbel noise if requested
+    if use_gumbel and logits.requires_grad:  # Only during training
+        # Sample Gumbel noise: g = -log(-log(u)) where u ~ Uniform(0,1)
+        # Ensure random sampling happens on device (MPS/CUDA)
+        u = torch.rand_like(logits, device=logits.device)
+        gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+        logits_with_noise = logits + gumbel_noise
+    else:
+        logits_with_noise = logits
+
+    # Apply temperature-scaled softmax to get character weights
+    weights = torch.softmax(logits_with_noise / temperature, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
 
     # Vectorized rendering using einsum
     # weights: (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
@@ -180,8 +192,9 @@ def render_ascii(logits, char_bitmaps):
     return rendered
 
 
-def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interval=100, warmup_iterations=50):
-    """Train ASCII art using gradient descent with cosine learning rate schedule."""
+def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interval=100, warmup_iterations=50, diversity_weight=0.01,
+          use_gumbel=True, temp_start=1.0, temp_end=0.01):
+    """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, and Gumbel-softmax."""
 
     # Clear and create steps directory
     if os.path.exists("steps"):
@@ -211,17 +224,40 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
     # Loss function
     criterion = nn.MSELoss()
 
-    print(f"\nTraining for {num_iterations} iterations with warmup={warmup_iterations}...")
+    print(f"\nTraining for {num_iterations} iterations with warmup={warmup_iterations}")
+    print(f"Gumbel-softmax: {use_gumbel}, Temperature: {temp_start} -> {temp_end}")
 
     pbar = tqdm(range(num_iterations))
     for iteration in pbar:
         optimizer.zero_grad()
 
-        # Render current ASCII art
-        rendered = render_ascii(logits, char_bitmaps)
+        # Compute current temperature based on learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        if iteration < warmup_iterations:
+            temperature = temp_start
+        else:
+            lr_ratio = current_lr / lr  # Ratio of current LR to initial LR
+            temperature = temp_end + (temp_start - temp_end) * lr_ratio
 
-        # Compute loss
-        loss = criterion(rendered, target_image)
+        # Render current ASCII art with Gumbel-softmax
+        rendered = render_ascii(logits, char_bitmaps, temperature=temperature, use_gumbel=use_gumbel)
+
+        # Compute reconstruction loss
+        recon_loss = criterion(rendered, target_image)
+
+        if diversity_weight != 0.0:
+            # Compute diversity loss (entropy of character usage)
+            weights = torch.softmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
+            char_usage = weights.mean(dim=[0, 1])  # (NUM_CHARS,) - average usage of each character
+            # Entropy: -sum(p * log(p)) - higher entropy = more diverse
+            entropy = -(char_usage * torch.log(char_usage + 1e-10)).sum()
+            # We want to maximize entropy, so subtract it (or add negative)
+            diversity_loss = -entropy
+        else:
+            diversity_loss = torch.tensor(0.0).to(DEVICE)
+
+        # Total loss
+        loss = recon_loss + diversity_weight * diversity_loss
 
         # Backprop
         loss.backward()
@@ -229,8 +265,12 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         scheduler.step()
 
         # Update progress bar
-        current_lr = optimizer.param_groups[0]['lr']
-        pbar.set_postfix({'loss': f'{loss.item():.6f}', 'lr': f'{current_lr:.6f}'})
+        pbar.set_postfix({
+            'recon': f'{recon_loss.item():.4f}',
+            'div': f'{diversity_loss.item():.4f}',
+            'lr': f'{current_lr:.4f}',
+            'temp': f'{temperature:.4f}'
+        })
 
         # Save intermediate results
         if iteration % save_interval == 0 or iteration == num_iterations - 1:
@@ -238,13 +278,14 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
                 logits,
                 char_bitmaps,
                 output_path=f"steps/i_iter_{iteration:04d}.png",
-                text_path=f"steps/t_iter_{iteration:04d}.txt"
+                text_path=f"steps/t_iter_{iteration:04d}.txt",
+                temperature=temperature
             )
 
     return logits
 
 
-def save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt"):
+def save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", temperature=0.1):
     """Save the final ASCII art as image and text."""
     # Get discrete character selection for text file
     char_indices = torch.argmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH) - keep on device
@@ -256,8 +297,8 @@ def save_result(logits, char_bitmaps, output_path="output.png", text_path="outpu
             line = ''.join(CHARS[char_indices_cpu[i, j].item()] for j in range(GRID_WIDTH))
             f.write(line + '\n')
 
-    # Render with soft selection (logits will be softmaxed inside render_ascii)
-    rendered = render_ascii(logits, char_bitmaps)
+    # Render with soft selection (no Gumbel noise for deterministic output)
+    rendered = render_ascii(logits, char_bitmaps, temperature=temperature, use_gumbel=False)
 
     # Save as image
     img_array = (rendered.detach().cpu().numpy() * 255).astype(np.uint8)
@@ -331,9 +372,10 @@ if __name__ == "__main__":
     target_image = load_target_image(input_image_path)
 
     # Train
-    logits = train(target_image, char_bitmaps, num_iterations=10000, lr=0.01, warmup_iterations=500)
+    logits = train(target_image, char_bitmaps, num_iterations=10000, lr=0.01, warmup_iterations=1000, diversity_weight=0.0,
+                   use_gumbel=True, temp_start=1.0, temp_end=0.1)
 
-    # Save final results
-    save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt")
+    # Save final results (use low temperature for sharp output)
+    save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", temperature=0.01)
 
     print("\nDone!")

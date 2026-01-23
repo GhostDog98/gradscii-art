@@ -108,9 +108,19 @@ def create_char_bitmaps():
     return bitmaps_tensor
 
 
-def load_target_image(image_path):
-    """Load and preprocess target image."""
-    img = Image.open(image_path).convert('L')
+def load_target_image(image_path, keep_rgb=False):
+    """Load and preprocess target image.
+
+    Args:
+        image_path: path to image
+        keep_rgb: if True, return RGB tensor instead of grayscale
+    """
+    img = Image.open(image_path)
+
+    if keep_rgb:
+        img = img.convert('RGB')
+    else:
+        img = img.convert('L')
 
     # Resize to content dimensions (without gap space)
     content_height = CHAR_HEIGHT * GRID_HEIGHT  # 504
@@ -119,12 +129,20 @@ def load_target_image(image_path):
     # Convert to array and normalize to [0, 1]
     img_array = np.array(img).astype(np.float32) / 255.0
 
-    # Pad to match IMAGE_HEIGHT if we have row gaps (split padding top and bottom)
-    if IMAGE_HEIGHT > content_height:
-        padding = IMAGE_HEIGHT - content_height
-        pad_top = padding // 2
-        pad_bottom = padding - pad_top
-        img_array = np.pad(img_array, ((pad_top, pad_bottom), (0, 0)), mode='constant', constant_values=1.0)  # White padding
+    if keep_rgb:
+        # Pad RGB image: (H, W, 3)
+        if IMAGE_HEIGHT > content_height:
+            padding = IMAGE_HEIGHT - content_height
+            pad_top = padding // 2
+            pad_bottom = padding - pad_top
+            img_array = np.pad(img_array, ((pad_top, pad_bottom), (0, 0), (0, 0)), mode='constant', constant_values=1.0)
+    else:
+        # Pad grayscale image: (H, W)
+        if IMAGE_HEIGHT > content_height:
+            padding = IMAGE_HEIGHT - content_height
+            pad_top = padding // 2
+            pad_bottom = padding - pad_top
+            img_array = np.pad(img_array, ((pad_top, pad_bottom), (0, 0)), mode='constant', constant_values=1.0)  # White padding
 
     # Convert to tensor
     img_tensor = torch.tensor(img_array, dtype=torch.float32, device=DEVICE)
@@ -185,6 +203,201 @@ def plot_curve_ascii(curve, width=32, height=16):
     print("  0" + " " * (width // 2 - 1) + "input" + " " * (width // 2 - 4) + "1")
 
 
+def optimize_rgb_curves(rgb_image, iterations=250, lr=0.01):
+    """
+    Learn a neural network to map RGB→LAB→grayscale for maximum separability.
+
+    Uses a small MLP: LAB (3D) -> hidden layers -> grayscale (1D)
+    
+    Main idea: we need to lose information somehow. We lose information by sacrificing distinguishibility
+    of nearby colors. Push similar colors together to make more room in the space for more colors total.
+
+    Args:
+        rgb_image: (H, W, 3) tensor with values in [0, 1]
+        iterations: optimization iterations
+        lr: learning rate
+
+    Returns:
+        gray_image: (H, W) grayscale tensor
+        model: the learned neural network
+    """
+    print(f"\nLearning LAB→grayscale mapping for maximum separability ({iterations} iterations)...")
+    print(f"  Architecture: LAB(3) -> Dense(16) -> ReLU -> Dense(8) -> ReLU -> Dense(1) -> Sigmoid")
+
+    H, W, C = rgb_image.shape
+    assert C == 3, "Input must be RGB"
+
+    # Convert entire image to LAB upfront
+    rgb_flat = rgb_image.reshape(-1, 3)  # (H*W, 3)
+
+    # Linearize sRGB
+    mask = rgb_flat > 0.04045
+    rgb_linear = torch.where(mask,
+                             ((rgb_flat + 0.055) / 1.055) ** 2.4,
+                             rgb_flat / 12.92)
+
+    # RGB to XYZ
+    rgb_to_xyz = torch.tensor([
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041]
+    ], device=DEVICE, dtype=rgb_flat.dtype)
+    xyz = rgb_linear @ rgb_to_xyz.T
+
+    # XYZ to LAB
+    xyz_n = torch.tensor([0.95047, 1.0, 1.08883], device=DEVICE, dtype=xyz.dtype)
+    xyz_norm = xyz / xyz_n
+    delta = 6.0 / 29.0
+    mask_f = xyz_norm > delta ** 3
+    f_xyz = torch.where(mask_f,
+                       xyz_norm ** (1.0 / 3.0),
+                       xyz_norm / (3.0 * delta ** 2) + 4.0 / 29.0)
+
+    L = 116.0 * f_xyz[:, 1] - 16.0
+    a = 500.0 * (f_xyz[:, 0] - f_xyz[:, 1])
+    b = 200.0 * (f_xyz[:, 1] - f_xyz[:, 2])
+    lab_full = torch.stack([L, a, b], dim=-1)  # (H*W, 3)
+
+    # Normalize LAB to reasonable range for neural network
+    # L: [0, 100], a: [-128, 127], b: [-128, 127]
+    lab_normalized = lab_full.clone()
+    lab_normalized[:, 0] = lab_normalized[:, 0] / 100.0  # L to [0, 1]
+    lab_normalized[:, 1] = (lab_normalized[:, 1] + 128.0) / 255.0  # a to [0, 1]
+    lab_normalized[:, 2] = (lab_normalized[:, 2] + 128.0) / 255.0  # b to [0, 1]
+
+    # Downsample LAB for loss computation (low-frequency focus)
+    downsample_factor = 4
+    lab_image = lab_normalized.reshape(H, W, 3)
+    lab_for_loss = lab_image.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+    lab_downsampled = F.avg_pool2d(lab_for_loss, kernel_size=downsample_factor, stride=downsample_factor)
+    lab_downsampled = lab_downsampled.squeeze(0).permute(1, 2, 0)  # (H', W', 3)
+    H_down, W_down, _ = lab_downsampled.shape
+
+    # Build simple MLP with GELU activations (prevent dead neurons)
+    model = nn.Sequential(
+        nn.Linear(3, 16),
+        nn.GELU(),
+        nn.Linear(16, 8),
+        nn.GELU(),
+        nn.Linear(8, 1),
+        nn.Sigmoid()
+    ).to(DEVICE)
+
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+
+    # Cosine learning rate schedule with warmup
+    warmup_iterations = int(0.1 * iterations)  # 10% warmup
+
+    for i in range(iterations):
+        # Adjust learning rate
+        if i < warmup_iterations:
+            # Linear warmup
+            lr_mult = i / warmup_iterations
+        else:
+            # Cosine annealing
+            progress = (i - warmup_iterations) / (iterations - warmup_iterations)
+            lr_mult = 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159265359)))
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr * lr_mult
+
+        optimizer.zero_grad()
+
+        # Forward pass on full image
+        gray_flat = model(lab_normalized).squeeze(-1)  # (H*W,)
+        gray_image = gray_flat.reshape(H, W)
+
+        # Downsample grayscale for loss
+        gray_for_loss = gray_image.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        gray_downsampled = F.avg_pool2d(gray_for_loss, kernel_size=downsample_factor, stride=downsample_factor)
+        gray_downsampled = gray_downsampled.squeeze()  # (H', W')
+
+        # Sample random pixels for distance preservation
+        num_pixels_down = H_down * W_down
+        num_samples = min(10000, num_pixels_down)
+        indices = torch.randperm(num_pixels_down, device=DEVICE)[:num_samples]
+
+        lab_flat = lab_downsampled.reshape(num_pixels_down, 3)
+        lab_samples = lab_flat[indices]  # (num_samples, 3)
+        gray_samples = gray_downsampled.reshape(num_pixels_down)[indices]  # (num_samples,)
+
+        # Compute pairwise distances (subsample for efficiency)
+        num_pairs = min(1000, num_samples)
+        pair_indices = torch.randperm(num_samples, device=DEVICE)[:num_pairs]
+
+        lab_subset = lab_samples[pair_indices]  # (num_pairs, 3)
+        gray_subset = gray_samples[pair_indices]  # (num_pairs,)
+
+        # Pairwise LAB distances
+        lab_dist = torch.cdist(lab_subset, lab_subset, p=2)  # (num_pairs, num_pairs)
+
+        # Pairwise grayscale distances
+        gray_dist = torch.cdist(gray_subset.unsqueeze(-1), gray_subset.unsqueeze(-1), p=2).squeeze(-1)
+
+        # Distance-preserving loss via cross-entropy over similarity distributions
+        temperature = 0.1
+        lab_similarities = F.softmax(-lab_dist / temperature, dim=-1)
+        gray_similarities = F.log_softmax(-gray_dist / temperature, dim=-1)
+
+        # Contrastive clustering loss: create gaps between color clusters
+        # For similar LAB colors: pull grayscale values together (cluster)
+        # For different LAB colors: push grayscale values apart (create gaps)
+
+        lab_dist_flat = lab_dist.flatten()
+        gray_dist_flat = gray_dist.flatten()
+
+        # Define similarity threshold - pairs closer than this should cluster
+        similarity_threshold = torch.quantile(lab_dist_flat, 0.2)  # Bottom 20% = similar
+        dissimilarity_threshold = torch.quantile(lab_dist_flat, 0.5)  # Top 50% = different
+
+        similar_mask = lab_dist_flat < similarity_threshold
+        different_mask = lab_dist_flat > dissimilarity_threshold
+
+        # Pull similar colors together in grayscale (minimize their distance)
+        if similar_mask.sum() > 0:
+            cluster_loss = gray_dist_flat[similar_mask].mean()
+        else:
+            cluster_loss = torch.tensor(0.0, device=DEVICE)
+
+        # Push different colors apart in grayscale with a margin
+        margin = 0.25  # Minimum grayscale separation for different colors
+        if different_mask.sum() > 0:
+            # Hinge loss: penalize if grayscale distance < margin
+            separation_loss = torch.clamp(margin - gray_dist_flat[different_mask], min=0.0).mean()
+        else:
+            separation_loss = torch.tensor(0.0, device=DEVICE)
+
+        # Luminance preservation: roughly match L channel (weak constraint)
+        # keep white as white, keep black as black
+        luminance_input = lab_normalized[:, 0]
+        luminance_loss = ((gray_flat - luminance_input) ** 2).mean()
+
+        # Total loss
+        loss = cluster_loss + 1*separation_loss + 5*luminance_loss
+
+        loss.backward()
+        optimizer.step()
+
+        if i % 50 == 0 or i == iterations - 1:
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"  Iteration {i}/{iterations}: cluster={cluster_loss.item():.4f}, separate={separation_loss.item():.4f}, luma={luminance_loss.item():.4f}, lr={current_lr:.6f}")
+
+    # Generate final grayscale
+    with torch.no_grad():
+        gray_final = model(lab_normalized).squeeze(-1).reshape(H, W)
+
+    print(f"LAB→grayscale learning complete.")
+    print(f"  Output brightness range: [{gray_final.min().item():.3f}, {gray_final.max().item():.3f}]")
+
+    # Save result
+    gray_img_array = (gray_final.cpu().numpy() * 255).astype(np.uint8)
+    gray_img = Image.fromarray(gray_img_array, mode='L')
+    gray_img.save("rgb_curves_output.png")
+    print(f"  Saved grayscale result to: rgb_curves_output.png")
+
+    return gray_final, model
+
+
 def optimize_contrast_curve_field(image, num_bins=64, iterations=200, lr=0.05, smoothness_weight=0.01):
     """
     Optimize a spatially-varying tone curve field to maximize local entropy.
@@ -195,7 +408,8 @@ def optimize_contrast_curve_field(image, num_bins=64, iterations=200, lr=0.05, s
         num_bins: number of bins per curve (kept smaller than 256 for performance)
         iterations: optimization iterations
         lr: learning rate
-        smoothness_weight: regularization weight for curve smoothness between neighbors
+        smoothness_weight: regularization weight for curve smoothness between neighbors.
+                           Lower regularization leads to a strong effect like an anime artist who went too hard with the shading.
 
     Returns:
         contrast_adjusted: (H, W) tensor with adjusted contrast
@@ -1024,7 +1238,7 @@ Examples:
                        help='Weight for multiscale perceptual loss (dithering effect) - optimizes for how it looks when downsampled (default: 0.5, try 0.0-1.0)')
     parser.add_argument('--multiscale-kernel', type=int, default=4,
                        help='Downsampling kernel size for multiscale loss (default: 4, simulates viewing distance)')
-    parser.add_argument('--optimize-alignment', action='store_true', default=True,
+    parser.add_argument('--optimize-alignment', action='store_true',
                        help='Learn global spatial translation, scaling, and warp matrix to align image with character grid. Warning: slow')
     parser.add_argument('--alignment-lr', type=float, default=0.1,
                        help='Learning rate for spatial alignment (default: 0.1)')
@@ -1044,8 +1258,10 @@ Examples:
     # Output configuration
     parser.add_argument('--dark-mode', action='store_true',
                        help='Invert colors for dark mode (white text on black background)')
-    parser.add_argument('--optimize-contrast', action='store_true', default=True,
-                       help='Optimize tone curve to maximize histogram entropy (fixes poor contrast). (Default: true)')
+    parser.add_argument('--optimize-contrast', action='store_true',
+                       help='Optimize tone curve to maximize histogram entropy (fixes poor contrast). Higher values lead to more shading. (Default: true)')
+    parser.add_argument('--optimize-rgb-to-gray', action='store_true',
+                       help='Learn model to map RGB to grayscale to maximize color separation (for color images). Important for images where information is mostly chrominance')
     parser.add_argument('--save-interval', type=int, default=100,
                        help='Save intermediate results every N iterations (default: 100)')
     parser.add_argument('--output', type=str, default='output.png',
@@ -1164,14 +1380,21 @@ if __name__ == "__main__":
 
     # Training mode
     char_bitmaps = create_char_bitmaps()
-    target_image = load_target_image(args.input_image)
 
-    # Optimize contrast curve if requested
-    if args.optimize_contrast:
-        target_image, contrast_curve = optimize_contrast_curve_field(target_image)
-
-        # Plot the curve as ASCII art
-        plot_curve_ascii(contrast_curve)
+    # Load image (RGB if optimizing RGB curves, else grayscale)
+    if args.optimize_rgb_to_gray:
+        target_image_rgb = load_target_image(args.input_image, keep_rgb=True)
+        target_image, rgb_curves = optimize_rgb_curves(target_image_rgb)
+        # Optionally also optimize contrast on the resulting grayscale
+        if args.optimize_contrast:
+            target_image, contrast_curve = optimize_contrast_curve_field(target_image)
+            plot_curve_ascii(contrast_curve)
+    else:
+        target_image = load_target_image(args.input_image, keep_rgb=False)
+        # Optimize contrast curve if requested
+        if args.optimize_contrast:
+            target_image, contrast_curve = optimize_contrast_curve_field(target_image)
+            plot_curve_ascii(contrast_curve)
 
     result = train(
         target_image, char_bitmaps,

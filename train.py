@@ -6,21 +6,25 @@ import numpy as np
 from tqdm import tqdm
 import os
 import shutil
+import argparse
 
-# Configuration
+# Default Configuration (can be overridden via command line arguments)
 CHAR_WIDTH = 12
 CHAR_HEIGHT = 24
 GRID_WIDTH = 42
 GRID_HEIGHT = 21
-ROW_GAP = 6  # Gap between rows (receipt printer spacing. Use 0 for discord, 6 for receipt printer)
-IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH  # 504
-IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT + ROW_GAP * (GRID_HEIGHT - 1)  # 504 + 120 = 624
+ROW_GAP = 6
+IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH
+IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT + ROW_GAP * (GRID_HEIGHT - 1)
 
-# Character encoding (cp437 for receipt printers, ascii for standard text)
 ENCODING = 'cp437'
+BANNED_CHARS = ['`', '\\']
 
-# Ban certain characters (block characters that feel like cheating)
-BANNED_CHARS = ['`', '\\'] # ['░', '▒', '▓', '█', '▄', '▌', '▐', '▀', '■']
+PRINTER_FONT = "./fonts/bitArray-A2.ttf"
+PRINTER_FONT_SIZE = 24
+PRINTER_Y_OFFSET = 4
+FALLBACK_FONTS = ["/System/Library/Fonts/Supplemental/Menlo.ttc", "/System/Library/Fonts/Monaco.dfont"]
+FALLBACK_FONT_SIZE = 18
 
 # Device configuration
 if torch.backends.mps.is_available():
@@ -33,44 +37,30 @@ else:
     DEVICE = torch.device("cpu")
     print("Using CPU device")
 
-# Character set based on encoding
-if ENCODING == 'cp437':
-    CHARS = ''.join(bytes([i]).decode('cp437') for i in range(32, 256))
-else:
-    # Standard 7-bit ASCII
-    CHARS = ''.join(chr(i) for i in range(32, 127))
-
-CHARS = ''.join(c for c in CHARS if c not in BANNED_CHARS)
-
-NUM_CHARS = len(CHARS)
-
-print(f"Using {NUM_CHARS} characters ({ENCODING}): {CHARS}")
+# Character set (initialized in main after parsing args)
+CHARS = ''
+NUM_CHARS = 0
 
 
 def create_char_bitmaps():
     """Create a lookup table of character bitmaps with font fallback."""
     print("Creating character bitmap LUT...")
 
-    # Try to load printer font (bitArray-A2.ttf) for 7-bit ASCII
+    # Try to load printer font for 7-bit ASCII
     printer_font, printer_y_offset = None, None
     try:
-        printer_font, printer_y_offset = ImageFont.truetype("./fonts/bitArray-A2.ttf", 24), 4
-        # printer_font, printer_y_offset = ImageFont.truetype("./fonts/gg mono.ttf", 18), 0 # for discord
-        print("Loaded printer font: bitArray-A2.ttf (24pt)")
+        printer_font = ImageFont.truetype(PRINTER_FONT, PRINTER_FONT_SIZE)
+        printer_y_offset = PRINTER_Y_OFFSET
+        print(f"Loaded printer font: {PRINTER_FONT} ({PRINTER_FONT_SIZE}pt)")
     except:
         print("Printer font not found, using fallback for all characters")
 
-    # Load fallback font (Menlo for extended ASCII)
+    # Load fallback font for extended ASCII
     fallback_font = None
-    fallback_paths = [
-        # "./fonts/SourceCodePro-VariableFont_wght.ttf", # for discord
-        "/System/Library/Fonts/Supplemental/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.dfont",
-    ]
-    for path in fallback_paths:
+    for path in FALLBACK_FONTS:
         try:
-            fallback_font = ImageFont.truetype(path, 18)
-            print(f"Loaded fallback font: {path} (18pt)")
+            fallback_font = ImageFont.truetype(path, FALLBACK_FONT_SIZE)
+            print(f"Loaded fallback font: {path} ({FALLBACK_FONT_SIZE}pt)")
             break
         except:
             continue
@@ -374,31 +364,223 @@ def test_char_bitmaps():
             print(f"Saved char_{safe_name}.png - shape: {bitmap.shape}, min: {bitmap.min():.2f}, max: {bitmap.max():.2f}")
 
 
-if __name__ == "__main__":
-    import sys
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Train ASCII art using gradient descent',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Presets:
+  epson    Receipt printer (CP437, bitArray-A2 font, 6px row gap)
+  discord  Discord display (ASCII, gg mono font, no row gap)
+
+Examples:
+  python train.py image.jpg
+  python train.py image.jpg --preset discord
+  python train.py image.jpg --iterations 20000 --diversity-weight 0.05
+        """
+    )
+
+    # Required arguments
+    parser.add_argument('input_image', help='Input image path')
+
+    # Preset configuration
+    parser.add_argument('--preset', choices=['epson', 'discord'],
+                       help='Use preset configuration (epson=receipt printer, discord=Discord)')
+
+    # Grid configuration
+    parser.add_argument('--char-width', type=int, default=12,
+                       help='Character width in pixels (default: 12)')
+    parser.add_argument('--char-height', type=int, default=24,
+                       help='Character height in pixels (default: 24)')
+    parser.add_argument('--grid-width', type=int, default=42,
+                       help='Number of characters per row (default: 42)')
+    parser.add_argument('--grid-height', type=int, default=21,
+                       help='Number of character rows (default: 21)')
+    parser.add_argument('--row-gap', type=int, default=6,
+                       help='Gap between rows in pixels (default: 6 for receipt printer, 0 for Discord)')
+
+    # Character set configuration
+    parser.add_argument('--encoding', choices=['cp437', 'ascii'], default='cp437',
+                       help='Character encoding (cp437 for receipt printers, ascii for standard text)')
+    parser.add_argument('--ban-chars', type=str, default='`\\',
+                       help='Characters to ban from charset (default: "`\\")')
+    parser.add_argument('--ban-blocks', action='store_true',
+                       help='Ban block characters: ░▒▓█▄▌▐▀■')
+
+    # Font configuration
+    parser.add_argument('--printer-font', type=str, default='./fonts/bitArray-A2.ttf',
+                       help='Path to printer font for 7-bit ASCII (default: bitArray-A2.ttf)')
+    parser.add_argument('--printer-font-size', type=int, default=24,
+                       help='Printer font size in points (default: 24)')
+    parser.add_argument('--printer-y-offset', type=int, default=4,
+                       help='Y offset for printer font rendering (default: 4)')
+    parser.add_argument('--fallback-font', type=str,
+                       default='/System/Library/Fonts/Supplemental/Menlo.ttc',
+                       help='Path to fallback font for extended ASCII')
+    parser.add_argument('--fallback-font-size', type=int, default=18,
+                       help='Fallback font size in points (default: 18)')
+
+    # Training hyperparameters
+    parser.add_argument('--iterations', type=int, default=10000,
+                       help='Number of training iterations (default: 10000)')
+    parser.add_argument('--lr', type=float, default=0.01,
+                       help='Learning rate (default: 0.01)')
+    parser.add_argument('--warmup', type=int, default=1000,
+                       help='Number of warmup iterations for learning rate schedule (default: 1000)')
+    parser.add_argument('--diversity-weight', type=float, default=0.01,
+                       help='Weight for diversity loss encouraging varied character usage (default: 0.01, set to 0 to disable)')
+    parser.add_argument('--penalize-whitespace', action='store_true',
+                       help='Include whitespace in diversity penalty (default: whitespace is protected)')
+
+    # Gumbel-softmax parameters
+    parser.add_argument('--no-gumbel', action='store_true',
+                       help='Disable Gumbel-softmax (use plain softmax)')
+    parser.add_argument('--temp-start', type=float, default=1.0,
+                       help='Starting temperature for Gumbel-softmax (default: 1.0, higher = more exploration)')
+    parser.add_argument('--temp-end', type=float, default=0.1,
+                       help='Ending temperature for Gumbel-softmax (default: 0.1, lower = more discrete)')
+    parser.add_argument('--save-temp', type=float, default=0.01,
+                       help='Temperature for final output rendering (default: 0.01)')
+
+    # Output configuration
+    parser.add_argument('--save-interval', type=int, default=100,
+                       help='Save intermediate results every N iterations (default: 100)')
+    parser.add_argument('--output', type=str, default='output.png',
+                       help='Output image path (default: output.png)')
+    parser.add_argument('--output-text', type=str, default='output.txt',
+                       help='Output text file path (default: output.txt)')
+    parser.add_argument('--output-utf8', type=str, default='output.utf8.txt',
+                       help='Output UTF-8 text file path (default: output.utf8.txt)')
 
     # Test mode
-    # test_char_bitmaps()
-    # exit()
+    parser.add_argument('--test-chars', action='store_true',
+                       help='Test character rendering and exit')
 
-    # Training mode (disabled for now)
-    if len(sys.argv) < 2: 
-        print("Usage: python train.py <input_image>")
-        sys.exit(1)
+    args = parser.parse_args()
 
-    input_image_path = sys.argv[1]
+    # Apply presets
+    if args.preset == 'epson':
+        args.encoding = 'cp437'
+        args.printer_font = './fonts/bitArray-A2.ttf'
+        args.printer_font_size = 24
+        args.printer_y_offset = 4
+        args.row_gap = 6
+        args.ban_chars = '`\\'
+    elif args.preset == 'discord':
+        args.encoding = 'utf-8'
+        args.printer_font = './fonts/gg mono.ttf'
+        args.printer_font_size = 18
+        args.printer_y_offset = 0
+        args.row_gap = 0
+        args.fallback_font = './fonts/SourceCodePro-VariableFont_wght.ttf'
+        args.ban_chars = '`\\'
 
-    # Create character bitmaps
+    # Add block characters to ban list if requested
+    if args.ban_blocks:
+        args.ban_chars += '░▒▓█▄▌▐▀■'
+
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    # Update global configuration from args
+    CHAR_WIDTH = args.char_width
+    CHAR_HEIGHT = args.char_height
+    GRID_WIDTH = args.grid_width
+    GRID_HEIGHT = args.grid_height
+    ROW_GAP = args.row_gap
+    IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH
+    IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT + ROW_GAP * (GRID_HEIGHT - 1)
+
+    ENCODING = args.encoding
+    BANNED_CHARS = list(args.ban_chars)
+
+    PRINTER_FONT = args.printer_font
+    PRINTER_FONT_SIZE = args.printer_font_size
+    PRINTER_Y_OFFSET = args.printer_y_offset
+    FALLBACK_FONTS = [args.fallback_font]
+    FALLBACK_FONT_SIZE = args.fallback_font_size
+
+    # Rebuild character set with new configuration
+    if ENCODING == 'cp437':
+        CHARS = ''.join(bytes([i]).decode('cp437') for i in range(32, 256))
+    else:
+        CHARS = ''.join(chr(i) for i in range(32, 127))
+    CHARS = ''.join(c for c in CHARS if c not in BANNED_CHARS)
+    NUM_CHARS = len(CHARS)
+
+    # Print all configuration
+    print("=" * 70)
+    print("CONFIGURATION")
+    print("=" * 70)
+    print(f"Preset:           {args.preset or 'None'}")
+    print(f"Input Image:      {args.input_image if not args.test_chars else 'N/A (test mode)'}")
+    print()
+    print("Grid Configuration:")
+    print(f"  Grid Size:      {GRID_WIDTH}x{GRID_HEIGHT} characters")
+    print(f"  Character Size: {CHAR_WIDTH}x{CHAR_HEIGHT} pixels")
+    print(f"  Row Gap:        {ROW_GAP} pixels")
+    print(f"  Image Size:     {IMAGE_WIDTH}x{IMAGE_HEIGHT} pixels")
+    print()
+    print("Character Set:")
+    print(f"  Encoding:       {ENCODING}")
+    print(f"  Total Chars:    {NUM_CHARS}")
+    print(f"  Banned:         {repr(args.ban_chars) if args.ban_chars else 'None'}")
+    print(f"  Included:       {CHARS}")
+    print()
+    print("Fonts:")
+    print(f"  Printer Font:   {PRINTER_FONT} ({PRINTER_FONT_SIZE}pt, y-offset={PRINTER_Y_OFFSET})")
+    print(f"  Fallback Font:  {args.fallback_font} ({FALLBACK_FONT_SIZE}pt)")
+    print()
+    print("Training Hyperparameters:")
+    print(f"  Iterations:     {args.iterations}")
+    print(f"  Learning Rate:  {args.lr}")
+    print(f"  Warmup:         {args.warmup} iterations")
+    print(f"  Diversity:      {args.diversity_weight} (whitespace {'protected' if not args.penalize_whitespace else ' '})")
+    print(f"  Gumbel-softmax: {'Enabled' if not args.no_gumbel else 'Disabled'}")
+    if not args.no_gumbel:
+        print(f"    Temperature:  {args.temp_start} → {args.temp_end}")
+        print(f"    Save Temp:    {args.save_temp}")
+    print()
+    print("Output:")
+    print(f"  Save Interval:  every {args.save_interval} iterations")
+    print(f"  Output Image:   {args.output}")
+    print(f"  Output Text:    {args.output_text}")
+    print(f"  Output UTF-8:   {args.output_utf8}")
+    print("=" * 70)
+    print()
+
+    # Test mode
+    if args.test_chars:
+        test_char_bitmaps()
+        exit()
+
+    # Training mode
     char_bitmaps = create_char_bitmaps()
+    target_image = load_target_image(args.input_image)
 
-    # Load target image
-    target_image = load_target_image(input_image_path)
+    logits = train(
+        target_image, char_bitmaps,
+        num_iterations=args.iterations,
+        lr=args.lr,
+        save_interval=args.save_interval,
+        warmup_iterations=args.warmup,
+        diversity_weight=args.diversity_weight,
+        use_gumbel=not args.no_gumbel,
+        temp_start=args.temp_start,
+        temp_end=args.temp_end,
+        protect_whitespace=not args.penalize_whitespace
+    )
 
-    # Train
-    logits = train(target_image, char_bitmaps, num_iterations=10000, lr=0.01, warmup_iterations=1000, diversity_weight=0.01,
-                   use_gumbel=True, temp_start=1.0, temp_end=0.1, protect_whitespace=False)
-
-    # Save final results (use low temperature for sharp output)
-    save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", utf8_path="output.utf8.txt", temperature=0.01)
+    save_result(
+        logits, char_bitmaps,
+        output_path=args.output,
+        text_path=args.output_text,
+        utf8_path=args.output_utf8,
+        temperature=args.save_temp
+    )
 
     print("\nDone!")

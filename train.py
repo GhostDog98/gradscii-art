@@ -177,7 +177,7 @@ def plot_curve_ascii(curve, width=32, height=16):
         lines.append(''.join(line))
 
     # Print with border
-    print("\n  Learned Contrast Curve:")
+    print("\n  Learned Contrast Curve (Center Control Point):")
     print("  +" + "-" * width + "+")
     for line in lines:
         print("  |" + line + "|")
@@ -185,35 +185,219 @@ def plot_curve_ascii(curve, width=32, height=16):
     print("  0" + " " * (width // 2 - 1) + "input" + " " * (width // 2 - 4) + "1")
 
 
-def optimize_contrast_curve(image, num_bins=256):
+def optimize_contrast_curve_field(image, num_bins=64, iterations=200, lr=0.05, smoothness_weight=0.01):
     """
-    Apply histogram equalization to maximize contrast.
+    Optimize a spatially-varying tone curve field to maximize local entropy.
+    Each control point has its own tone curve, interpolated across the image.
 
     Args:
         image: (H, W) tensor with values in [0, 1]
-        num_bins: number of histogram bins
+        num_bins: number of bins per curve (kept smaller than 256 for performance)
+        iterations: optimization iterations
+        lr: learning rate
+        smoothness_weight: regularization weight for curve smoothness between neighbors
 
     Returns:
         contrast_adjusted: (H, W) tensor with adjusted contrast
-        curve: the equalization curve (CDF) for visualization
+        center_curve: curve at center control point for visualization
     """
-    print(f"\nApplying histogram equalization...")
+    print(f"\nOptimizing spatially-varying tone curve field ({iterations} iterations)...")
+    print(f"  Control grid: ({GRID_HEIGHT+1} × {GRID_WIDTH+1}) = {(GRID_HEIGHT+1)*(GRID_WIDTH+1)} control points")
+    print(f"  Bins per curve: {num_bins}")
 
-    # Compute histogram and CDF (classical histogram equalization)
-    img_np = image.cpu().numpy().flatten()
-    hist, bins = np.histogram(img_np, num_bins, [0, 1])
-    cdf = hist.cumsum()
-    cdf = cdf / cdf[-1]  # Normalize to [0, 1]
+    H, W = image.shape
 
-    # Apply equalization via interpolation
-    equalized_np = np.interp(img_np, bins[:-1], cdf).reshape(image.shape)
-    equalized_image = torch.from_numpy(equalized_np).float().to(DEVICE)
+    # Initialize curve increments for each control point
+    # Shape: (GRID_HEIGHT+1, GRID_WIDTH+1, num_bins)
+    # Start with uniform increments (identity curves everywhere)
+    curve_increments = nn.Parameter(
+        torch.ones(GRID_HEIGHT + 1, GRID_WIDTH + 1, num_bins, device=DEVICE) / num_bins
+    )
 
-    print(f"Histogram equalization complete.")
+    optimizer = optim.Adam([curve_increments], lr=lr)
+
+    # Precompute pixel-to-control-point interpolation (reuse warp cache structure)
+    cy0, cy1, cx0, cx1 = WARP_INTERP_CACHE['cy0'], WARP_INTERP_CACHE['cy1'], WARP_INTERP_CACHE['cx0'], WARP_INTERP_CACHE['cx1']
+    wy0, wy1, wx0, wx1 = WARP_INTERP_CACHE['wy0'], WARP_INTERP_CACHE['wy1'], WARP_INTERP_CACHE['wx0'], WARP_INTERP_CACHE['wx1']
+
+    for i in range(iterations):
+        optimizer.zero_grad()
+
+        # Build curves for each control point via cumsum
+        positive_increments = F.softplus(curve_increments)  # (H+1, W+1, bins)
+        normalized_increments = positive_increments / positive_increments.sum(dim=-1, keepdim=True)
+        curves = torch.cumsum(normalized_increments, dim=-1)  # (H+1, W+1, bins)
+        # Prepend 0 to each curve
+        curves = torch.cat([torch.zeros(GRID_HEIGHT+1, GRID_WIDTH+1, 1, device=DEVICE), curves], dim=-1)  # (H+1, W+1, bins+1)
+
+        # For each pixel, interpolate curve parameters from 4 nearest control points
+        # Then apply the interpolated curve
+        img_flat = image.flatten()
+
+        # Get curves at 4 corners for each pixel
+        curves_00 = curves[cy0, cx0]  # (H, W, bins+1)
+        curves_01 = curves[cy0, cx1]
+        curves_10 = curves[cy1, cx0]
+        curves_11 = curves[cy1, cx1]
+
+        # Flatten spatial dimensions
+        curves_00 = curves_00.reshape(-1, num_bins + 1)  # (H*W, bins+1)
+        curves_01 = curves_01.reshape(-1, num_bins + 1)
+        curves_10 = curves_10.reshape(-1, num_bins + 1)
+        curves_11 = curves_11.reshape(-1, num_bins + 1)
+
+        # Bilinearly interpolate curve parameters
+        w00 = (wy0 * wx0).flatten().unsqueeze(-1)  # (H*W, 1)
+        w01 = (wy0 * wx1).flatten().unsqueeze(-1)
+        w10 = (wy1 * wx0).flatten().unsqueeze(-1)
+        w11 = (wy1 * wx1).flatten().unsqueeze(-1)
+
+        interp_curves = curves_00 * w00 + curves_01 * w01 + curves_10 * w10 + curves_11 * w11  # (H*W, bins+1)
+
+        # Apply interpolated curve to each pixel
+        # Map pixel value to curve via interpolation
+        bin_indices = (img_flat * num_bins).clamp(0, num_bins)
+        idx0 = torch.floor(bin_indices).long()
+        idx1 = torch.clamp(idx0 + 1, 0, num_bins)
+        weight1 = bin_indices - idx0.float()
+        weight0 = 1.0 - weight1
+
+        # Index into interpolated curves (vectorized)
+        adjusted_flat = interp_curves[torch.arange(len(img_flat), device=DEVICE), idx0] * weight0 + \
+                        interp_curves[torch.arange(len(img_flat), device=DEVICE), idx1] * weight1
+
+        adjusted = adjusted_flat.reshape(image.shape)
+
+        # Compute histogram and entropy
+        # Use soft binning for differentiability
+        bin_centers = torch.linspace(0, 1, num_bins, device=DEVICE)
+        distances = torch.abs(adjusted_flat.unsqueeze(1) - bin_centers.unsqueeze(0))
+        sigma = 0.02
+        weights = torch.exp(-distances ** 2 / (2 * sigma ** 2))
+        histogram = weights.sum(dim=0)
+        histogram = histogram / histogram.sum()
+
+        entropy = -(histogram * torch.log(histogram + 1e-10)).sum()
+
+        # Smoothness regularization: penalize differences between neighboring control points' curves
+        # Horizontal differences
+        dx_increments = curve_increments[:, 1:, :] - curve_increments[:, :-1, :]
+        # Vertical differences
+        dy_increments = curve_increments[1:, :, :] - curve_increments[:-1, :, :]
+
+        smoothness_loss = (dx_increments ** 2).mean() + (dy_increments ** 2).mean()
+
+        # Total loss: maximize entropy (minimize -entropy) + smoothness regularization
+        loss = -entropy + smoothness_weight * smoothness_loss
+
+        loss.backward()
+        optimizer.step()
+
+        if i % 50 == 0 or i == iterations - 1:
+            print(f"  Iteration {i}/{iterations}: entropy={entropy.item():.4f}, smoothness={smoothness_loss.item():.4f}")
+
+    # Apply final curves
+    with torch.no_grad():
+        positive_increments = F.softplus(curve_increments)
+        normalized_increments = positive_increments / positive_increments.sum(dim=-1, keepdim=True)
+        curves_final = torch.cumsum(normalized_increments, dim=-1)
+        curves_final = torch.cat([torch.zeros(GRID_HEIGHT+1, GRID_WIDTH+1, 1, device=DEVICE), curves_final], dim=-1)
+
+        img_flat = image.flatten()
+
+        curves_00 = curves_final[cy0, cx0]
+        curves_01 = curves_final[cy0, cx1]
+        curves_10 = curves_final[cy1, cx0]
+        curves_11 = curves_final[cy1, cx1]
+
+        # Flatten spatial dimensions
+        curves_00 = curves_00.reshape(-1, num_bins + 1)
+        curves_01 = curves_01.reshape(-1, num_bins + 1)
+        curves_10 = curves_10.reshape(-1, num_bins + 1)
+        curves_11 = curves_11.reshape(-1, num_bins + 1)
+
+        w00 = (wy0 * wx0).flatten().unsqueeze(-1)
+        w01 = (wy0 * wx1).flatten().unsqueeze(-1)
+        w10 = (wy1 * wx0).flatten().unsqueeze(-1)
+        w11 = (wy1 * wx1).flatten().unsqueeze(-1)
+
+        interp_curves = curves_00 * w00 + curves_01 * w01 + curves_10 * w10 + curves_11 * w11
+
+        bin_indices = (img_flat * num_bins).clamp(0, num_bins)
+        idx0 = torch.floor(bin_indices).long()
+        idx1 = torch.clamp(idx0 + 1, 0, num_bins)
+        weight1 = bin_indices - idx0.float()
+        weight0 = 1.0 - weight1
+
+        adjusted_flat = interp_curves[torch.arange(len(img_flat), device=DEVICE), idx0] * weight0 + \
+                        interp_curves[torch.arange(len(img_flat), device=DEVICE), idx1] * weight1
+        adjusted_image = adjusted_flat.reshape(image.shape)
+
+        # Get center curve for visualization
+        center_y = GRID_HEIGHT // 2
+        center_x = GRID_WIDTH // 2
+        center_curve = curves_final[center_y, center_x].cpu().numpy()
+
+    print(f"Spatially-varying contrast optimization complete.")
     print(f"  Input brightness range: [{image.min().item():.3f}, {image.max().item():.3f}]")
-    print(f"  Output brightness range: [{equalized_image.min().item():.3f}, {equalized_image.max().item():.3f}]")
+    print(f"  Output brightness range: [{adjusted_image.min().item():.3f}, {adjusted_image.max().item():.3f}]")
 
-    return equalized_image, cdf
+    # Visualize non-linearity map
+    print_curve_nonlinearity_map(curves_final, width=32, height=16)
+
+    return adjusted_image, center_curve
+
+
+def print_curve_nonlinearity_map(curves, width=32, height=16):
+    """
+    Display a 32×16 ASCII map showing how non-linear each control point's curve is.
+
+    Args:
+        curves: (GRID_HEIGHT+1, GRID_WIDTH+1, num_bins+1) tensor of curves
+        width: display width in characters
+        height: display height in characters
+    """
+    # Compute non-linearity for each control point
+    # Non-linearity = RMS deviation from identity curve (y=x)
+    num_bins = curves.shape[-1]
+    identity = torch.linspace(0, 1, num_bins, device=curves.device)
+    deviations = (curves - identity) ** 2  # (H+1, W+1, bins)
+    nonlinearity = torch.sqrt(deviations.mean(dim=-1))  # (H+1, W+1)
+
+    # Convert to numpy
+    nonlinearity_np = nonlinearity.cpu().numpy()
+
+    # Resample to display size
+    from scipy.ndimage import zoom
+    scale_y = height / nonlinearity_np.shape[0]
+    scale_x = width / nonlinearity_np.shape[1]
+    resampled = zoom(nonlinearity_np, (scale_y, scale_x), order=1)
+
+    # Map to ASCII characters (low to high non-linearity)
+    chars = ' .-:=+*#@'
+    min_val = resampled.min()
+    max_val = resampled.max()
+
+    print("\n  Curve Non-linearity Map (deviation from identity):")
+    print("  +" + "-" * width + "+")
+
+    for row in range(height):
+        line = []
+        for col in range(width):
+            val = resampled[row, col]
+            # Normalize to [0, 1]
+            if max_val > min_val:
+                normalized = (val - min_val) / (max_val - min_val)
+            else:
+                normalized = 0
+            # Map to character
+            char_idx = int(normalized * (len(chars) - 1))
+            char_idx = min(char_idx, len(chars) - 1)
+            line.append(chars[char_idx])
+        print("  |" + ''.join(line) + "|")
+
+    print("  +" + "-" * width + "+")
+    print(f"  Range: {min_val:.3f} (linear) to {max_val:.3f} (very non-linear)")
 
 
 def precompute_warp_interpolation_structure(H, W):
@@ -626,8 +810,16 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         else:
             warp_reg_loss = torch.tensor(0.0).to(DEVICE)
 
+        # Gentle regularization on global alignment parameters (prefer identity transform)
+        if optimize_alignment:
+            alignment_reg_weight = 0.001
+            alignment_reg_loss = (translation_x ** 2 + translation_y ** 2 +
+                                 scale_x_param ** 2 + scale_y_param ** 2)
+        else:
+            alignment_reg_loss = torch.tensor(0.0).to(DEVICE)
+
         # Total loss
-        loss = recon_loss + multiscale_weight * multiscale_loss + diversity_weight * diversity_loss + warp_reg_weight * warp_reg_loss
+        loss = recon_loss + multiscale_weight * multiscale_loss + diversity_weight * diversity_loss + warp_reg_weight * warp_reg_loss + alignment_reg_loss
 
         # Backprop
         loss.backward()
@@ -976,7 +1168,7 @@ if __name__ == "__main__":
 
     # Optimize contrast curve if requested
     if args.optimize_contrast:
-        target_image, contrast_curve = optimize_contrast_curve(target_image)
+        target_image, contrast_curve = optimize_contrast_curve_field(target_image)
 
         # Plot the curve as ASCII art
         plot_curve_ascii(contrast_curve)

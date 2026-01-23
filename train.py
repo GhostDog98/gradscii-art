@@ -468,7 +468,7 @@ Examples:
         args.row_gap = 6
         args.ban_chars = ''
     elif args.preset == 'discord':
-        args.encoding = 'utf-8'
+        args.encoding = 'cp437'
         args.printer_font = './fonts/gg mono.ttf'
         args.printer_font_size = 18
         args.printer_y_offset = 0

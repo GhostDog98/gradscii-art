@@ -185,95 +185,35 @@ def plot_curve_ascii(curve, width=32, height=16):
     print("  0" + " " * (width // 2 - 1) + "input" + " " * (width // 2 - 4) + "1")
 
 
-def optimize_contrast_curve(image, num_bins=256, iterations=200, lr=0.1):
+def optimize_contrast_curve(image, num_bins=256):
     """
-    Optimize a monotonic tone curve to maximize entropy of the image histogram.
+    Apply histogram equalization to maximize contrast.
 
     Args:
         image: (H, W) tensor with values in [0, 1]
-        num_bins: number of bins for the tone curve
-        iterations: optimization iterations
-        lr: learning rate
+        num_bins: number of histogram bins
 
     Returns:
         contrast_adjusted: (H, W) tensor with adjusted contrast
-        curve: the learned tone curve for visualization
+        curve: the equalization curve (CDF) for visualization
     """
-    print(f"\nOptimizing contrast curve ({iterations} iterations)...")
+    print(f"\nApplying histogram equalization...")
 
-    # Parameterize curve as cumulative sum of positive increments (ensures monotonicity)
-    # Start with uniform increments (identity curve)
-    increments = nn.Parameter(torch.ones(num_bins, device=DEVICE) / num_bins)
+    # Compute histogram and CDF (classical histogram equalization)
+    img_np = image.cpu().numpy().flatten()
+    hist, bins = np.histogram(img_np, num_bins, [0, 1])
+    cdf = hist.cumsum()
+    cdf = cdf / cdf[-1]  # Normalize to [0, 1]
 
-    optimizer = optim.Adam([increments], lr=lr)
+    # Apply equalization via interpolation
+    equalized_np = np.interp(img_np, bins[:-1], cdf).reshape(image.shape)
+    equalized_image = torch.from_numpy(equalized_np).float().to(DEVICE)
 
-    for i in range(iterations):
-        optimizer.zero_grad()
+    print(f"Histogram equalization complete.")
+    print(f"  Input brightness range: [{image.min().item():.3f}, {image.max().item():.3f}]")
+    print(f"  Output brightness range: [{equalized_image.min().item():.3f}, {equalized_image.max().item():.3f}]")
 
-        # Build monotonic curve via cumsum of softplus(increments)
-        positive_increments = F.softplus(increments)
-        # Normalize so curve goes from 0 to 1
-        normalized_increments = positive_increments / positive_increments.sum()
-        curve = torch.cumsum(normalized_increments, dim=0)
-        curve = torch.cat([torch.zeros(1, device=DEVICE), curve])  # Prepend 0
-
-        # Apply curve to image via interpolation
-        # Quantize image to bin indices
-        img_flat = image.flatten()
-        bin_indices = (img_flat * (num_bins - 1)).clamp(0, num_bins - 1)
-
-        # Bilinear interpolation from curve
-        idx0 = torch.floor(bin_indices).long()
-        idx1 = torch.clamp(idx0 + 1, 0, num_bins)
-        weight1 = bin_indices - idx0.float()
-        weight0 = 1.0 - weight1
-
-        adjusted_flat = curve[idx0] * weight0 + curve[idx1] * weight1
-        adjusted = adjusted_flat.reshape(image.shape)
-
-        # Compute histogram (differentiable via soft binning)
-        # Create soft histogram by using distances to bin centers
-        bin_centers = torch.linspace(0, 1, num_bins, device=DEVICE)
-        # Shape: (num_pixels, num_bins)
-        distances = torch.abs(adjusted_flat.unsqueeze(1) - bin_centers.unsqueeze(0))
-        # Soft binning with small sigma for sharpness
-        sigma = 0.02
-        weights = torch.exp(-distances ** 2 / (2 * sigma ** 2))
-        histogram = weights.sum(dim=0)
-        histogram = histogram / histogram.sum()  # Normalize
-
-        # Entropy: -sum(p * log(p))
-        entropy = -(histogram * torch.log(histogram + 1e-10)).sum()
-
-        # Maximize entropy (minimize negative entropy)
-        loss = -entropy
-
-        loss.backward()
-        optimizer.step()
-
-        if i % 25 == 0 or i == iterations - 1:
-            print(f"  Iteration {i}/{iterations}: entropy={entropy.item():.4f}")
-
-    # Apply final curve
-    with torch.no_grad():
-        positive_increments = F.softplus(increments)
-        normalized_increments = positive_increments / positive_increments.sum()
-        curve_final = torch.cumsum(normalized_increments, dim=0)
-        curve_final = torch.cat([torch.zeros(1, device=DEVICE), curve_final])
-
-        img_flat = image.flatten()
-        bin_indices = (img_flat * (num_bins - 1)).clamp(0, num_bins - 1)
-        idx0 = torch.floor(bin_indices).long()
-        idx1 = torch.clamp(idx0 + 1, 0, num_bins)
-        weight1 = bin_indices - idx0.float()
-        weight0 = 1.0 - weight1
-
-        adjusted_flat = curve_final[idx0] * weight0 + curve_final[idx1] * weight1
-        adjusted_image = adjusted_flat.reshape(image.shape)
-
-    print(f"Contrast optimization complete. Entropy improved from input to output.")
-
-    return adjusted_image, curve_final.cpu().numpy()
+    return equalized_image, cdf
 
 
 def precompute_warp_interpolation_structure(H, W):

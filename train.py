@@ -403,8 +403,8 @@ Examples:
     # Character set configuration
     parser.add_argument('--encoding', choices=['cp437', 'ascii'], default='cp437',
                        help='Character encoding (cp437 for receipt printers, ascii for standard text)')
-    parser.add_argument('--ban-chars', type=str, default='`\\',
-                       help='Characters to ban from charset (default: "`\\")')
+    parser.add_argument('--ban-chars', type=str, default='',
+                       help='Characters to ban from charset (default: "")')
     parser.add_argument('--ban-blocks', action='store_true',
                        help='Ban block characters: ░▒▓█▄▌▐▀■')
 
@@ -466,7 +466,7 @@ Examples:
         args.printer_font_size = 24
         args.printer_y_offset = 4
         args.row_gap = 6
-        args.ban_chars = '`\\'
+        args.ban_chars = ''
     elif args.preset == 'discord':
         args.encoding = 'utf-8'
         args.printer_font = './fonts/gg mono.ttf'

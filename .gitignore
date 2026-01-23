@@ -1,0 +1,10 @@
+venv/
+steps/
+**.pyc
+.DS_Store
+char_grid.png
+char_space.png
+charset_test.png
+output.png
+output.txt
+output.utf8.txt

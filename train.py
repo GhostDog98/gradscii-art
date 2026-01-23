@@ -12,12 +12,15 @@ CHAR_WIDTH = 12
 CHAR_HEIGHT = 24
 GRID_WIDTH = 42
 GRID_HEIGHT = 21
-ROW_GAP = 6  # Gap between rows (receipt printer spacing)
+ROW_GAP = 6  # Gap between rows (receipt printer spacing. Use 0 for discord, 6 for receipt printer)
 IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH  # 504
 IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT + ROW_GAP * (GRID_HEIGHT - 1)  # 504 + 120 = 624
 
 # Character encoding (cp437 for receipt printers, ascii for standard text)
 ENCODING = 'cp437'
+
+# Ban certain characters (block characters that feel like cheating)
+BANNED_CHARS = ['`', '\\'] # ['░', '▒', '▓', '█', '▄', '▌', '▐', '▀', '■']
 
 # Device configuration
 if torch.backends.mps.is_available():
@@ -37,8 +40,6 @@ else:
     # Standard 7-bit ASCII
     CHARS = ''.join(chr(i) for i in range(32, 127))
 
-# Ban certain characters (block characters that feel like cheating)
-BANNED_CHARS = ['░', '▒', '▓', '█', '▄', '▌', '▐', '▀', '■']
 CHARS = ''.join(c for c in CHARS if c not in BANNED_CHARS)
 
 NUM_CHARS = len(CHARS)
@@ -51,9 +52,10 @@ def create_char_bitmaps():
     print("Creating character bitmap LUT...")
 
     # Try to load printer font (bitArray-A2.ttf) for 7-bit ASCII
-    printer_font = None
+    printer_font, printer_y_offset = None, None
     try:
-        printer_font = ImageFont.truetype("./bitArray-A2.ttf", 24)
+        printer_font, printer_y_offset = ImageFont.truetype("./fonts/bitArray-A2.ttf", 24), 4
+        # printer_font, printer_y_offset = ImageFont.truetype("./fonts/gg mono.ttf", 18), 0 # for discord
         print("Loaded printer font: bitArray-A2.ttf (24pt)")
     except:
         print("Printer font not found, using fallback for all characters")
@@ -61,6 +63,7 @@ def create_char_bitmaps():
     # Load fallback font (Menlo for extended ASCII)
     fallback_font = None
     fallback_paths = [
+        # "./fonts/SourceCodePro-VariableFont_wght.ttf", # for discord
         "/System/Library/Fonts/Supplemental/Menlo.ttc",
         "/System/Library/Fonts/Monaco.dfont",
     ]
@@ -88,7 +91,7 @@ def create_char_bitmaps():
         if printer_font is not None and char_code < 127:
             # Use printer font with Y offset 4
             font = printer_font
-            y_offset = 4
+            y_offset = printer_y_offset
             printer_count += 1
         else:
             # Use fallback font with Y offset 0
@@ -193,7 +196,7 @@ def render_ascii(logits, char_bitmaps, temperature=1.0, use_gumbel=False):
 
 
 def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interval=100, warmup_iterations=50, diversity_weight=0.01,
-          use_gumbel=True, temp_start=1.0, temp_end=0.01):
+          use_gumbel=True, temp_start=1.0, temp_end=0.01, protect_whitespace=True):
     """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, and Gumbel-softmax."""
 
     # Clear and create steps directory
@@ -237,7 +240,9 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
             temperature = temp_start
         else:
             lr_ratio = current_lr / lr  # Ratio of current LR to initial LR
-            temperature = temp_end + (temp_start - temp_end) * lr_ratio
+            # lr_ratio_curved = ((1 - lr_ratio) ** 2) # Square the LR ratio so we stay high temp for longer
+            lr_ratio_curved = ((1 - lr_ratio))
+            temperature = temp_start + (temp_end - temp_start) * lr_ratio_curved
 
         # Render current ASCII art with Gumbel-softmax
         rendered = render_ascii(logits, char_bitmaps, temperature=temperature, use_gumbel=use_gumbel)
@@ -246,11 +251,24 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         recon_loss = criterion(rendered, target_image)
 
         if diversity_weight != 0.0:
-            # Compute diversity loss (entropy of character usage)
+            # Compute diversity loss (entropy of character usage, excluding whitespace)
             weights = torch.softmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
             char_usage = weights.mean(dim=[0, 1])  # (NUM_CHARS,) - average usage of each character
+
+            # Exclude whitespace from diversity calculation
+            space_idx = CHARS.index(' ') if ' ' in CHARS else -1
+            if space_idx >= 0 and protect_whitespace:
+                # Mask out space character
+                mask = torch.ones(NUM_CHARS, device=DEVICE)
+                mask[space_idx] = 0
+                char_usage_masked = char_usage * mask
+                # Renormalize (only among non-space characters)
+                char_usage_masked = char_usage_masked / (char_usage_masked.sum() + 1e-10)
+            else:
+                char_usage_masked = char_usage
+
             # Entropy: -sum(p * log(p)) - higher entropy = more diverse
-            entropy = -(char_usage * torch.log(char_usage + 1e-10)).sum()
+            entropy = -(char_usage_masked * torch.log(char_usage_masked + 1e-10)).sum()
             # We want to maximize entropy, so subtract it (or add negative)
             diversity_loss = -entropy
         else:
@@ -285,7 +303,7 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
     return logits
 
 
-def save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", temperature=0.1):
+def save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", utf8_path="", temperature=0.1):
     """Save the final ASCII art as image and text."""
     # Get discrete character selection for text file
     char_indices = torch.argmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH) - keep on device
@@ -296,6 +314,11 @@ def save_result(logits, char_bitmaps, output_path="output.png", text_path="outpu
         for i in range(GRID_HEIGHT):
             line = ''.join(CHARS[char_indices_cpu[i, j].item()] for j in range(GRID_WIDTH))
             f.write(line + '\n')
+
+    if utf8_path:
+        with open(text_path, 'r', encoding=ENCODING) as f1:
+            with open(utf8_path, 'w', encoding='utf-8') as f2:
+                f2.write(f1.read())
 
     # Render with soft selection (no Gumbel noise for deterministic output)
     rendered = render_ascii(logits, char_bitmaps, temperature=temperature, use_gumbel=False)
@@ -359,7 +382,7 @@ if __name__ == "__main__":
     # exit()
 
     # Training mode (disabled for now)
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2: 
         print("Usage: python train.py <input_image>")
         sys.exit(1)
 
@@ -372,10 +395,10 @@ if __name__ == "__main__":
     target_image = load_target_image(input_image_path)
 
     # Train
-    logits = train(target_image, char_bitmaps, num_iterations=10000, lr=0.01, warmup_iterations=1000, diversity_weight=0.0,
-                   use_gumbel=True, temp_start=1.0, temp_end=0.1)
+    logits = train(target_image, char_bitmaps, num_iterations=10000, lr=0.01, warmup_iterations=1000, diversity_weight=0.01,
+                   use_gumbel=True, temp_start=1.0, temp_end=0.1, protect_whitespace=False)
 
     # Save final results (use low temperature for sharp output)
-    save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", temperature=0.01)
+    save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", utf8_path="output.utf8.txt", temperature=0.01)
 
     print("\nDone!")

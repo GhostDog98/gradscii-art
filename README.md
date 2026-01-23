@@ -2,6 +2,8 @@
 
 An approach to ASCII art generation that uses gradient descent optimization instead of lookup tables. This project produces high-quality ASCII art by treating character selection as a differentiable optimization problem.
 
+Is it overkill? Yes but fuck it we ball
+
 ⚠️⚠️⚠️⚠️ **this readme is vibed by claude so don't judge me if it's written in a npc like way** ⚠️⚠️⚠️⚠️
 
 ## Gallery

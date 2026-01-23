@@ -2,38 +2,45 @@
 
 An approach to ASCII art generation that uses gradient descent optimization instead of lookup tables. This project produces high-quality ASCII art by treating character selection as a differentiable optimization problem.
 
-**this readme is vibed by claude so don't judge me if it's written in a npc like way**
+⚠️⚠️⚠️⚠️ **this readme is vibed by claude so don't judge me if it's written in a npc like way** ⚠️⚠️⚠️⚠️
 
 ## Gallery
 
-![./examples/IMG_3591.jpg][./examples/IMG_3591.jpg]
+![Receipt printer output](./examples/IMG_3591.jpg)
 
-![./examples/IMG_3592.jpg][./examples/IMG_3592.jpg]
+![Receipt printer output](./examples/IMG_3592.jpg)
 
-![./examples/discord.png][./examples/discord.png]
+![Discord output](./examples/discord.png)
 
-![./examples/zellic.png][./examples/zellic.png]
-  
---
-
-Input: ![./testcases/test2.png][./testcases/test2.png]
+---
 
 Default settings
 
-![./examples/training_progress1.gif][./examples/training_progress1.gif]
+<img src="testcases/test2.png" width="378"> ![Training progress](./examples/training_progress1.gif)
 
---
+---
 
-![./examples/training_progress2.gif][./examples/training_progress2.gif]
-![./examples/training_progress3.gif][./examples/training_progress3.gif]
+Diversity weight 0.0 and disable annealing:
 
-![./testcases/test3.png][./testcases/test3.png] ![./examples/training_progress4.gif][./examples/training_progress4.gif]
+<img src="testcases/test.png" width="378"> <img src="examples/zellic.png" width="378">
 
-![./testcases/test4.png][./testcases/test4.png] ![./examples/training_progress5.gif][./examples/training_progress5.gif]
+Diversity weight 0.02 and 0.01:
+
+![Training progress](./examples/training_progress2.gif) ![Training progress](./examples/training_progress3.gif)
+
+---
+
+Benchmarks / torture tests
+
+<img src="testcases/test3.png" width="378"> ![Training progress](./examples/training_progress4.gif)
+
+<img src="testcases/test4.png" width="378"> ![Training progress](./examples/training_progress5.gif)
+
+---
 
 Identity mapping test
 
-![./examples/training_progress6.gif][./examples/training_progress6.gif]
+![Training progress](./examples/training_progress6.gif)
 
 ## Overview
 

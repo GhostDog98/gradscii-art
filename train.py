@@ -133,7 +133,59 @@ def load_target_image(image_path):
     return img_tensor
 
 
-def optimize_contrast_curve(image, num_bins=256, iterations=500, lr=0.1):
+def plot_curve_ascii(curve, width=32, height=16):
+    """
+    Plot a tone curve as ASCII art using sub-character resolution.
+
+    Args:
+        curve: numpy array of curve values (0-1)
+        width: plot width in characters
+        height: plot height in characters
+    """
+    # Characters for sub-row detail (6 levels from bottom to top within a row)
+    chars = "_.-^`'"
+
+    # Sample curve at width points
+    x_indices = np.linspace(0, len(curve) - 1, width).astype(int)
+    y_values = curve[x_indices]
+
+    # Build plot from top to bottom (row 0 = top = y=1.0)
+    lines = []
+    for row in range(height):
+        line = []
+        # Row represents y range [row_min, row_max]
+        row_max = 1.0 - (row / height)
+        row_min = 1.0 - ((row + 1) / height)
+
+        for col in range(width):
+            y = y_values[col]
+
+            if y >= row_max:
+                # Above this row
+                line.append(' ')
+            elif y < row_min:
+                # Below this row
+                line.append(' ')
+            else:
+                # Within this row - use sub-character detail
+                # Position within row (0=bottom, 1=top)
+                pos_in_row = (y - row_min) / (row_max - row_min)
+                char_idx = int(pos_in_row * len(chars))
+                char_idx = min(char_idx, len(chars) - 1)
+                line.append(chars[char_idx])
+
+        lines.append(''.join(line))
+
+    # Print with border
+    print("\n  Learned Contrast Curve:")
+    print("  +" + "-" * width + "+")
+    for line in lines:
+        print("  |" + line + "|")
+    print("  +" + "-" * width + "+")
+    print("  0" + " " * (width // 2 - 1) + "input" + " " * (width // 2 - 4) + "1")
+
+
+def optimize_contrast_curve(image, num_bins=256, iterations=200, lr=0.1):
     """
     Optimize a monotonic tone curve to maximize entropy of the image histogram.
 
@@ -199,7 +251,7 @@ def optimize_contrast_curve(image, num_bins=256, iterations=500, lr=0.1):
         loss.backward()
         optimizer.step()
 
-        if i % 100 == 0 or i == iterations - 1:
+        if i % 25 == 0 or i == iterations - 1:
             print(f"  Iteration {i}/{iterations}: entropy={entropy.item():.4f}")
 
     # Apply final curve
@@ -220,6 +272,7 @@ def optimize_contrast_curve(image, num_bins=256, iterations=500, lr=0.1):
         adjusted_image = adjusted_flat.reshape(image.shape)
 
     print(f"Contrast optimization complete. Entropy improved from input to output.")
+
     return adjusted_image, curve_final.cpu().numpy()
 
 
@@ -767,51 +820,6 @@ def save_result(logits, char_bitmaps, output_path="output.png", text_path="outpu
     img.save(output_path)
 
 
-def test_char_bitmaps():
-    """Test character bitmap creation and save visualizations."""
-    print("Testing character bitmap creation...")
-    char_bitmaps = create_char_bitmaps()
-
-    # Save a visualization of all characters
-    num_chars = char_bitmaps.shape[0]
-    chars_per_row = 16
-    num_rows = (num_chars + chars_per_row - 1) // chars_per_row
-
-    # Create a grid showing all characters
-    grid_height = num_rows * CHAR_HEIGHT
-    grid_width = chars_per_row * CHAR_WIDTH
-    grid = np.ones((grid_height, grid_width), dtype=np.float32)  # White background
-
-    for idx, char in enumerate(CHARS):
-        row = idx // chars_per_row
-        col = idx % chars_per_row
-
-        y_start = row * CHAR_HEIGHT
-        y_end = (row + 1) * CHAR_HEIGHT
-        x_start = col * CHAR_WIDTH
-        x_end = (col + 1) * CHAR_WIDTH
-
-        grid[y_start:y_end, x_start:x_end] = char_bitmaps[idx].cpu().numpy()
-
-    # Save grid
-    grid_img = Image.fromarray((grid * 255).astype(np.uint8), mode='L')
-    grid_img.save("char_grid.png")
-    print(f"Saved character grid to char_grid.png")
-    print(f"Grid dimensions: {grid_width}x{grid_height}")
-    print(f"Character dimensions: {CHAR_WIDTH}x{CHAR_HEIGHT}")
-
-    # Also save individual character examples
-    test_chars = "AaBb@#01 "
-    for char in test_chars:
-        if char in CHARS:
-            idx = CHARS.index(char)
-            bitmap = char_bitmaps[idx].cpu().numpy()
-            char_img = Image.fromarray((bitmap * 255).astype(np.uint8), mode='L')
-            safe_name = char if char != ' ' else 'space'
-            char_img.save(f"char_{safe_name}.png")
-            print(f"Saved char_{safe_name}.png - shape: {bitmap.shape}, min: {bitmap.min():.2f}, max: {bitmap.max():.2f}")
-
-
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -904,8 +912,8 @@ Examples:
     # Output configuration
     parser.add_argument('--dark-mode', action='store_true',
                        help='Invert colors for dark mode (white text on black background)')
-    parser.add_argument('--optimize-contrast', action='store_true',
-                       help='Optimize tone curve to maximize histogram entropy (fixes poor contrast)')
+    parser.add_argument('--optimize-contrast', action='store_true', default=True,
+                       help='Optimize tone curve to maximize histogram entropy (fixes poor contrast). (Default: true)')
     parser.add_argument('--save-interval', type=int, default=100,
                        help='Save intermediate results every N iterations (default: 100)')
     parser.add_argument('--output', type=str, default='output.png',
@@ -982,7 +990,7 @@ if __name__ == "__main__":
     print("CONFIGURATION")
     print("=" * 70)
     print(f"Preset:           {args.preset or 'None'}")
-    print(f"Input Image:      {args.input_image if not args.test_chars else 'N/A (test mode)'}")
+    print(f"Input Image:      {args.input_image}")
     print()
     print("Grid Configuration:")
     print(f"  Grid Size:      {GRID_WIDTH}x{GRID_HEIGHT} characters")
@@ -1022,11 +1030,6 @@ if __name__ == "__main__":
     print("=" * 70)
     print()
 
-    # Test mode
-    if args.test_chars:
-        test_char_bitmaps()
-        exit()
-
     # Training mode
     char_bitmaps = create_char_bitmaps()
     target_image = load_target_image(args.input_image)
@@ -1034,6 +1037,9 @@ if __name__ == "__main__":
     # Optimize contrast curve if requested
     if args.optimize_contrast:
         target_image, contrast_curve = optimize_contrast_curve(target_image)
+
+        # Plot the curve as ASCII art
+        plot_curve_ascii(contrast_curve)
 
     result = train(
         target_image, char_bitmaps,

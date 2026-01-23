@@ -17,6 +17,7 @@ GRID_HEIGHT = 21
 ROW_GAP = 6
 IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH
 IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT + ROW_GAP * (GRID_HEIGHT - 1)
+WARP_INTERP_CACHE = None  # Initialized after IMAGE_HEIGHT/WIDTH are set
 
 ENCODING = 'cp437'
 BANNED_CHARS = ['`', '\\']
@@ -130,6 +131,125 @@ def load_target_image(image_path):
 
     print(f"Target image shape: {img_tensor.shape}")
     return img_tensor
+
+
+def precompute_warp_interpolation_structure(H, W):
+    """Precompute fixed interpolation structure for control point warping (only depends on grid, not warp values)."""
+    # Create coordinate grids for output pixels
+    y_out = torch.arange(H, device=DEVICE, dtype=torch.float32).view(-1, 1)
+    x_out = torch.arange(W, device=DEVICE, dtype=torch.float32).view(1, -1)
+
+    # Map pixel coordinates to control grid coordinates
+    if ROW_GAP > 0:
+        char_y = y_out / (CHAR_HEIGHT + ROW_GAP)
+        char_x = x_out / CHAR_WIDTH
+    else:
+        char_y = y_out / CHAR_HEIGHT
+        char_x = x_out / CHAR_WIDTH
+
+    # Clamp and get control point indices
+    char_y_clamped = torch.clamp(char_y, 0, GRID_HEIGHT)
+    char_x_clamped = torch.clamp(char_x, 0, GRID_WIDTH)
+
+    cy0 = torch.floor(char_y_clamped).long()
+    cy1 = torch.clamp(cy0 + 1, 0, GRID_HEIGHT)
+    cx0 = torch.floor(char_x_clamped).long()
+    cx1 = torch.clamp(cx0 + 1, 0, GRID_WIDTH)
+
+    # Interpolation weights
+    wy1 = char_y_clamped - cy0.float()
+    wy0 = 1.0 - wy1
+    wx1 = char_x_clamped - cx0.float()
+    wx0 = 1.0 - wx1
+
+    # Centers for scaling
+    center_y = (H - 1) / 2.0
+    center_x = (W - 1) / 2.0
+
+    return {
+        'cy0': cy0, 'cy1': cy1, 'cx0': cx0, 'cx1': cx1,
+        'wy0': wy0, 'wy1': wy1, 'wx0': wx0, 'wx1': wx1,
+        'y_out': y_out, 'x_out': x_out,
+        'center_y': center_y, 'center_x': center_x
+    }
+
+
+def apply_spatially_varying_transform(image, tx_global, ty_global, warp_tx, warp_ty, scale_x, scale_y):
+    """
+    Apply spatially-varying transformation using precomputed global WARP_INTERP_CACHE.
+
+    Args:
+        image: (H, W) tensor
+        tx_global, ty_global: scalar global translation
+        warp_tx, warp_ty: (GRID_HEIGHT+1, GRID_WIDTH+1) local warp offsets
+        scale_x, scale_y: scalar scale factors
+    """
+    H, W = image.shape
+
+    # Unpack global cached values
+    cy0, cy1, cx0, cx1 = WARP_INTERP_CACHE['cy0'], WARP_INTERP_CACHE['cy1'], WARP_INTERP_CACHE['cx0'], WARP_INTERP_CACHE['cx1']
+    wy0, wy1, wx0, wx1 = WARP_INTERP_CACHE['wy0'], WARP_INTERP_CACHE['wy1'], WARP_INTERP_CACHE['wx0'], WARP_INTERP_CACHE['wx1']
+    y_out, x_out = WARP_INTERP_CACHE['y_out'], WARP_INTERP_CACHE['x_out']
+    center_y, center_x = WARP_INTERP_CACHE['center_y'], WARP_INTERP_CACHE['center_x']
+
+    # Bilinearly interpolate local warp offsets (this is the only dynamic part)
+    tx_warp_interp = (
+        warp_tx[cy0, cx0] * wy0 * wx0 +
+        warp_tx[cy0, cx1] * wy0 * wx1 +
+        warp_tx[cy1, cx0] * wy1 * wx0 +
+        warp_tx[cy1, cx1] * wy1 * wx1
+    )
+    ty_warp_interp = (
+        warp_ty[cy0, cx0] * wy0 * wx0 +
+        warp_ty[cy0, cx1] * wy0 * wx1 +
+        warp_ty[cy1, cx0] * wy1 * wx0 +
+        warp_ty[cy1, cx1] * wy1 * wx1
+    )
+
+    # Apply inverse transformation to find source coordinates
+    # Order: (1) scale from center, (2) global translate, (3) local warp
+    y_coords = (y_out - center_y) / scale_y + center_y - ty_global - ty_warp_interp
+    x_coords = (x_out - center_x) / scale_x + center_x - tx_global - tx_warp_interp
+
+    # Get integer coordinates for 4 neighbors
+    y0 = torch.floor(y_coords).long()
+    y1 = y0 + 1
+    x0 = torch.floor(x_coords).long()
+    x1 = x0 + 1
+
+    # Compute interpolation weights
+    wy1_interp = y_coords - y0.float()
+    wy0_interp = 1.0 - wy1_interp
+    wx1_interp = x_coords - x0.float()
+    wx0_interp = 1.0 - wx1_interp
+
+    # Create masks for valid coordinates (within bounds)
+    valid_y0 = (y0 >= 0) & (y0 < H)
+    valid_y1 = (y1 >= 0) & (y1 < H)
+    valid_x0 = (x0 >= 0) & (x0 < W)
+    valid_x1 = (x1 >= 0) & (x1 < W)
+
+    # Clamp coordinates for safe indexing
+    y0_safe = torch.clamp(y0, 0, H - 1)
+    y1_safe = torch.clamp(y1, 0, H - 1)
+    x0_safe = torch.clamp(x0, 0, W - 1)
+    x1_safe = torch.clamp(x1, 0, W - 1)
+
+    # Gather 4 neighbors with validity masks (white padding for out of bounds)
+    val_00 = torch.where(valid_y0 & valid_x0, image[y0_safe, x0_safe], torch.ones(1, device=DEVICE))
+    val_01 = torch.where(valid_y0 & valid_x1, image[y0_safe, x1_safe], torch.ones(1, device=DEVICE))
+    val_10 = torch.where(valid_y1 & valid_x0, image[y1_safe, x0_safe], torch.ones(1, device=DEVICE))
+    val_11 = torch.where(valid_y1 & valid_x1, image[y1_safe, x1_safe], torch.ones(1, device=DEVICE))
+
+    # Bilinear interpolation
+    transformed = (
+        val_00 * wy0_interp * wx0_interp +
+        val_01 * wy0_interp * wx1_interp +
+        val_10 * wy1_interp * wx0_interp +
+        val_11 * wy1_interp * wx1_interp
+    )
+
+    return transformed
 
 
 def apply_transform(image, tx, ty, scale_x, scale_y):
@@ -261,7 +381,7 @@ def render_ascii(logits, char_bitmaps, temperature=1.0, use_gumbel=False):
 
 def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interval=100, warmup_iterations=50, diversity_weight=0.01,
           use_gumbel=True, temp_start=1.0, temp_end=0.01, protect_whitespace=True, multiscale_weight=0.0, multiscale_kernel=4,
-          optimize_alignment=False, alignment_lr=0.01):
+          optimize_alignment=False, alignment_lr=0.01, warp_reg_weight=0.01, dark_mode=False):
     """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, multiscale perceptual loss, learnable spatial alignment, and Gumbel-softmax."""
 
     # Clear and create steps directory
@@ -274,20 +394,30 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         torch.randn(GRID_HEIGHT, GRID_WIDTH, NUM_CHARS, device=DEVICE) * 0.01
     )
 
-    # Learnable spatial transformation (translation + scaling)
+    # Learnable spatial transformation: global shift + per-control-point warping
     if optimize_alignment:
+        # Global translation (shifts entire image)
         translation_x = nn.Parameter(torch.zeros(1, device=DEVICE))
         translation_y = nn.Parameter(torch.zeros(1, device=DEVICE))
-        # Unconstrained parameters for scale (will be mapped via sigmoid to [0.75, 1.25])
-        scale_x_param = nn.Parameter(torch.zeros(1, device=DEVICE))  # 0 maps to 1.0 after sigmoid
+
+        # Control points at corners of character cells: (GRID_HEIGHT+1, GRID_WIDTH+1)
+        # Local warping on top of global shift
+        control_tx = nn.Parameter(torch.zeros(GRID_HEIGHT + 1, GRID_WIDTH + 1, device=DEVICE))
+        control_ty = nn.Parameter(torch.zeros(GRID_HEIGHT + 1, GRID_WIDTH + 1, device=DEVICE))
+
+        # Global scale (same for entire image)
+        scale_x_param = nn.Parameter(torch.zeros(1, device=DEVICE))  # sigmoid -> [0.9, 1.2]
         scale_y_param = nn.Parameter(torch.zeros(1, device=DEVICE))
+
         optimizer = optim.AdamW([
             {'params': [logits], 'lr': lr},
-            {'params': [translation_x, translation_y, scale_x_param, scale_y_param], 'lr': alignment_lr}
+            {'params': [translation_x, translation_y, control_tx, control_ty, scale_x_param, scale_y_param], 'lr': alignment_lr}
         ])
     else:
         translation_x = None
         translation_y = None
+        control_tx = None
+        control_ty = None
         scale_x_param = None
         scale_y_param = None
         optimizer = optim.AdamW([logits], lr=lr)
@@ -310,8 +440,8 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
     print(f"\nTraining for {num_iterations} iterations with warmup={warmup_iterations}")
     print(f"Gumbel-softmax: {use_gumbel}, Temperature: {temp_start} -> {temp_end}")
     if optimize_alignment:
-        print(f"Spatial alignment: Enabled (translate ±{CHAR_WIDTH/2:.1f}px H / ±{CHAR_HEIGHT/2:.1f}px V, scale 0.75-1.25x)")
-        print(f"  Alignment frozen during warmup, active after iteration {warmup_iterations}")
+        print(f"Spatial alignment: Global shift + deformation field ({GRID_HEIGHT+1}x{GRID_WIDTH+1} = {(GRID_HEIGHT+1)*(GRID_WIDTH+1)} control points)")
+        print(f"  Global translation ±{CHAR_WIDTH/2:.1f}px H/V + per-control-point warp ±{CHAR_WIDTH/2:.1f}px H/V, scale 0.9-1.25x")
 
     pbar = tqdm(range(num_iterations))
     for iteration in pbar:
@@ -332,28 +462,39 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
 
         # Apply learnable spatial transformation to target if enabled
         if optimize_alignment:
-            # Map unconstrained translation params to ±50% of character cell via tanh
-            # tanh(0) = 0 -> no translation at initialization
-            tx = (CHAR_WIDTH / 2) * torch.tanh(translation_x)
-            ty = (CHAR_HEIGHT / 2) * torch.tanh(translation_y)
-            # Map unconstrained scale params to [0.75, 1.25] via sigmoid
-            # sigmoid(0) = 0.5 -> maps to 1.0 (no scaling)
-            sx = 0.75 + 0.5 * torch.sigmoid(scale_x_param)
-            sy = 0.75 + 0.5 * torch.sigmoid(scale_y_param)
+            # Global translation (shifts entire image)
+            tx_base = (CHAR_WIDTH / 2) * torch.tanh(translation_x)
+            ty_base = (CHAR_HEIGHT / 2) * torch.tanh(translation_y)
 
-            # Apply transformation using manual bilinear interpolation
-            target_shifted = apply_transform(target_image, tx, ty, sx, sy)
+            # Local control point warping (bounded per control point)
+            tx_warp = (CHAR_WIDTH / 2) * torch.tanh(control_tx)  # (GRID_HEIGHT+1, GRID_WIDTH+1)
+            ty_warp = (CHAR_HEIGHT / 2) * torch.tanh(control_ty)
+
+            # Map unconstrained scale params to [0.9, 1.2] via sigmoid
+            sx = 0.9 + 0.3 * torch.sigmoid(scale_x_param)
+            sy = 0.9 + 0.3 * torch.sigmoid(scale_y_param)
+
+            # Apply spatially-varying transformation: scale -> global translate -> local warp
+            target_shifted = apply_spatially_varying_transform(target_image, tx_base, ty_base, tx_warp, ty_warp, sx, sy)
         else:
             target_shifted = target_image
 
+        # Invert for dark mode (white text on black background)
+        if dark_mode:
+            rendered_cmp = 1.0 - rendered
+            target_cmp = target_shifted #1.0 - target_shifted
+        else:
+            rendered_cmp = rendered
+            target_cmp = target_shifted
+
         # Compute reconstruction loss
-        recon_loss = criterion(rendered, target_shifted)
+        recon_loss = criterion(rendered_cmp, target_cmp)
 
         # Compute multiscale perceptual loss (dithering effect)
         if multiscale_weight != 0.0:
             # Add batch and channel dimensions for pooling
-            rendered_4d = rendered.unsqueeze(0).unsqueeze(0)
-            target_4d = target_shifted.unsqueeze(0).unsqueeze(0)
+            rendered_4d = rendered_cmp.unsqueeze(0).unsqueeze(0)
+            target_4d = target_cmp.unsqueeze(0).unsqueeze(0)
 
             # Downsample both rendered and target with overlapping patches
             # Use stride = kernel_size // 2 for 50% overlap
@@ -390,8 +531,20 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         else:
             diversity_loss = torch.tensor(0.0).to(DEVICE)
 
+        # Warp regularization: penalize non-uniform warping (spatial gradients)
+        if optimize_alignment and warp_reg_weight != 0.0:
+            # Penalize differences between neighboring control points (Total Variation)
+            # This allows uniform shifts but penalizes distortion
+            dx_tx = (tx_warp[:, 1:] - tx_warp[:, :-1]) ** 2  # horizontal differences in tx
+            dy_tx = (tx_warp[1:, :] - tx_warp[:-1, :]) ** 2  # vertical differences in tx
+            dx_ty = (ty_warp[:, 1:] - ty_warp[:, :-1]) ** 2  # horizontal differences in ty
+            dy_ty = (ty_warp[1:, :] - ty_warp[:-1, :]) ** 2  # vertical differences in ty
+            warp_reg_loss = dx_tx.mean() + dy_tx.mean() + dx_ty.mean() + dy_ty.mean()
+        else:
+            warp_reg_loss = torch.tensor(0.0).to(DEVICE)
+
         # Total loss
-        loss = recon_loss + multiscale_weight * multiscale_loss + diversity_weight * diversity_loss
+        loss = recon_loss + multiscale_weight * multiscale_loss + diversity_weight * diversity_loss + warp_reg_weight * warp_reg_loss
 
         # Backprop
         loss.backward()
@@ -409,9 +562,13 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
             postfix['ms'] = f'{multiscale_loss.item():.4f}'
         if diversity_weight != 0.0:
             postfix['div'] = f'{diversity_loss.item():.4f}'
+        if optimize_alignment and warp_reg_weight != 0.0:
+            postfix['w_reg'] = f'{warp_reg_loss.item():.4f}'
         if optimize_alignment:
-            postfix['tx'] = f'{tx.item():.1f}'
-            postfix['ty'] = f'{ty.item():.1f}'
+            # Show global base translation and mean warp
+            postfix['tx_base'] = f'{tx_base.item():.1f}'
+            postfix['ty_base'] = f'{ty_base.item():.1f}'
+            postfix['warp'] = f'{tx_warp.abs().mean().item():.1f}'
             postfix['sx'] = f'{sx.item():.3f}'
             postfix['sy'] = f'{sy.item():.3f}'
         pbar.set_postfix(postfix)
@@ -424,17 +581,25 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
                 output_path=f"steps/i_iter_{iteration:04d}.png",
                 text_path=f"steps/t_iter_{iteration:04d}.txt",
                 temperature=temperature,
-                target_image=target_shifted if optimize_alignment else None
+                target_image=target_shifted if optimize_alignment else None,
+                warp_params={'tx_warp': tx_warp, 'ty_warp': ty_warp, 'tx_base': tx_base.item(), 'ty_base': ty_base.item()} if optimize_alignment else None,
+                dark_mode=dark_mode
             )
 
     if optimize_alignment:
-        return logits, translation_x.item(), translation_y.item(), target_shifted
+        # Return global base translation and warp field
+        return logits, tx_base.item(), ty_base.item(), target_shifted, tx_warp, ty_warp
     else:
         return logits
 
 
-def save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", utf8_path="", temperature=0.1, target_image=None):
-    """Save the final ASCII art as image and text."""
+def save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", utf8_path="", temperature=0.1, target_image=None, warp_params=None, dark_mode=False):
+    """Save the final ASCII art as image and text.
+
+    Args:
+        warp_params: Optional dict with keys 'tx_warp', 'ty_warp', 'tx_base', 'ty_base' for visualizing deformation field
+        dark_mode: If True, invert colors for display (white text on black background)
+    """
     # Get discrete character selection for text file
     char_indices = torch.argmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH) - keep on device
 
@@ -453,16 +618,62 @@ def save_result(logits, char_bitmaps, output_path="output.png", text_path="outpu
     # Render with soft selection (no Gumbel noise for deterministic output)
     rendered = render_ascii(logits, char_bitmaps, temperature=temperature, use_gumbel=False)
 
+    # Invert for dark mode display
+    if dark_mode:
+        rendered = 1.0 - rendered
+
     # Save as image
     img_array = (rendered.detach().cpu().numpy() * 255).astype(np.uint8)
 
     # If target image provided, show side by side
     if target_image is not None:
-        target_array = (target_image.detach().cpu().numpy() * 255).astype(np.uint8)
-        # Horizontally concatenate: rendered | target
-        img_array = np.hstack([img_array, target_array])
+        target_display = target_image
+        # if dark_mode:
+        #     target_display = 1.0 - target_display
+        target_array = (target_display.detach().cpu().numpy() * 255).astype(np.uint8)
 
-    img = Image.fromarray(img_array, mode='L')
+        # Draw warp control points on target image if provided
+        if warp_params is not None:
+            from PIL import ImageDraw
+            # Convert to RGB to draw colored arrows
+            target_img = Image.fromarray(target_array, mode='L').convert('RGB')
+            draw = ImageDraw.Draw(target_img)
+
+            tx_warp = warp_params['tx_warp'].detach().cpu().numpy()  # (GRID_HEIGHT+1, GRID_WIDTH+1)
+            ty_warp = warp_params['ty_warp'].detach().cpu().numpy()
+            tx_base = warp_params['tx_base']
+            ty_base = warp_params['ty_base']
+
+            # Draw control points and displacement vectors
+            for i in range(GRID_HEIGHT + 1):
+                for j in range(GRID_WIDTH + 1):
+                    # Control point position in image coordinates
+                    if ROW_GAP > 0:
+                        y_pos = i * (CHAR_HEIGHT + ROW_GAP)
+                        x_pos = j * CHAR_WIDTH
+                    else:
+                        y_pos = i * CHAR_HEIGHT
+                        x_pos = j * CHAR_WIDTH
+
+                    # Warp displacement at this control point
+                    dx = tx_warp[i, j]
+                    dy = ty_warp[i, j]
+
+                    # Draw control point as a circle
+                    draw.circle([x_pos+dx, y_pos+dy], radius=2, fill=(255, 0, 0))
+
+            target_array = np.array(target_img)
+        else:
+            # Convert grayscale target to RGB for consistency
+            target_array = np.stack([target_array]*3, axis=-1)
+
+        # Convert rendered to RGB too
+        img_array_rgb = np.stack([img_array]*3, axis=-1)
+
+        # Horizontally concatenate: rendered | target
+        img_array = np.hstack([img_array_rgb, target_array])
+
+    img = Image.fromarray(img_array if target_image is not None else img_array, mode='RGB' if target_image is not None else 'L')
     img.save(output_path)
 
 
@@ -584,9 +795,11 @@ Examples:
     parser.add_argument('--multiscale-kernel', type=int, default=4,
                        help='Downsampling kernel size for multiscale loss (default: 4, simulates viewing distance)')
     parser.add_argument('--optimize-alignment', action='store_true', default=True,
-                       help='Learn spatial translation to align image with character grid (±50%% of character cell)')
+                       help='Learn global spatial translation, scaling, and warp matrix to align image with character grid. Warning: slow')
     parser.add_argument('--alignment-lr', type=float, default=0.1,
                        help='Learning rate for spatial alignment (default: 0.1)')
+    parser.add_argument('--warp-reg-weight', type=float, default=0.005,
+                       help='Regularization weight for penalizing strong warping (default: 0.005, 0 to disable). Lower values will warp harder')
 
     # Gumbel-softmax parameters
     parser.add_argument('--no-gumbel', action='store_true',
@@ -599,6 +812,8 @@ Examples:
                        help='Temperature for final output rendering (default: 0.01)')
 
     # Output configuration
+    parser.add_argument('--dark-mode', action='store_true',
+                       help='Invert colors for dark mode (white text on black background)')
     parser.add_argument('--save-interval', type=int, default=100,
                        help='Save intermediate results every N iterations (default: 100)')
     parser.add_argument('--output', type=str, default='output.png',
@@ -650,6 +865,9 @@ if __name__ == "__main__":
     IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH
     IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT + ROW_GAP * (GRID_HEIGHT - 1)
 
+    # Initialize warp interpolation cache for spatial alignment
+    WARP_INTERP_CACHE = precompute_warp_interpolation_structure(IMAGE_HEIGHT, IMAGE_WIDTH)
+
     ENCODING = args.encoding
     BANNED_CHARS = list(args.ban_chars)
 
@@ -689,6 +907,7 @@ if __name__ == "__main__":
     print("Fonts:")
     print(f"  Printer Font:   {PRINTER_FONT} ({PRINTER_FONT_SIZE}pt, y-offset={PRINTER_Y_OFFSET})")
     print(f"  Fallback Font:  {args.fallback_font} ({FALLBACK_FONT_SIZE}pt)")
+    print(f"  Dark mode:      {args.dark_mode}")
     print()
     print("Training Hyperparameters:")
     print(f"  Iterations:     {args.iterations}")
@@ -733,18 +952,19 @@ if __name__ == "__main__":
         multiscale_weight=args.multiscale_weight,
         multiscale_kernel=args.multiscale_kernel,
         optimize_alignment=args.optimize_alignment,
-        alignment_lr=args.alignment_lr
+        alignment_lr=args.alignment_lr,
+        warp_reg_weight=args.warp_reg_weight,
+        dark_mode=args.dark_mode
     )
 
     if args.optimize_alignment:
-        logits, tx_param, ty_param, target_shifted = result
-        # Compute actual transformed values from parameters
-        tx = (CHAR_WIDTH / 2) * np.tanh(tx_param)
-        ty = (CHAR_HEIGHT / 2) * np.tanh(ty_param)
-        print(f"\nLearned spatial translation: x={tx:.2f}px, y={ty:.2f}px")
+        logits, tx_base, ty_base, target_shifted, tx_warp, ty_warp = result
+        print(f"\nLearned global translation: x={tx_base:.2f}px, y={ty_base:.2f}px (+ per-control-point warping)")
+        warp_params = {'tx_warp': tx_warp, 'ty_warp': ty_warp, 'tx_base': tx_base, 'ty_base': ty_base}
     else:
         logits = result
         target_shifted = None
+        warp_params = None
 
     save_result(
         logits, char_bitmaps,
@@ -752,7 +972,9 @@ if __name__ == "__main__":
         text_path=args.output_text,
         utf8_path=args.output_utf8,
         temperature=args.save_temp,
-        target_image=target_shifted
+        target_image=target_shifted,
+        warp_params=warp_params,
+        dark_mode=args.dark_mode
     )
 
     print("\nDone!")

@@ -53,6 +53,98 @@ Identity mapping test
 
 ![Training progress](./examples/training_progress6.gif)
 
+## Warping
+
+Learnable affine transformation (scale+translate), warp matrix
+
+![./examples/learn_alignment.gif](./examples/learn_alignment.gif)
+
+![./examples/learn_alignment2.gif](./examples/learn_alignment2.gif)
+
+![./examples/learn_alignment3.gif](./examples/learn_alignment3.gif)
+
+![./examples/learn_alignment4.gif](./examples/learn_alignment4.gif)
+
+![./examples/learn_alignment5.gif](./examples/learn_alignment5.gif)
+
+![./examples/learn_alignment6.gif](./examples/learn_alignment6.gif)
+
+![./examples/learn_alignment7.gif](./examples/learn_alignment7.gif)
+
+![./examples/learn_alignment8.gif](./examples/learn_alignment8.gif)
+
+## Dynamic contrast
+
+Learnable contrast curve per each point on the character grid is bilinearly interpolated.
+
+![./examples/learn_contrast.gif](./examples/learn_contrast.gif)
+
+Yes this is completely overkill and it's mostly an artistic effect to add a fuck ton of shading
+
+```
+Curve Non-linearity Map (deviation from identity):                                                                09:43:06 [15/56867]
+  +--------------------------------+
+  |     ...-::==+=====:-..         |
+  |        .-:=++++===::-.         |
+  |....     -:=+++++===:-..---.    |
+  |...      .:=++**++===:::::::-...|
+  |         .-=+***++======+++==:::|
+  |        .-:=++**+++++++******+++|
+  |.-----..-:=++**++++++***#******+|
+  |::=:::-::=++***+++++***##***###*|
+  |=++======+++****+++***###****###|
+  |++++++++++++****+++*************|
+  |*******+++++*****+++**********++|
+  |#####**+==+++*****+++********+++|
+  |#####**+===+++****++=+****++++++|
+  |#@###**+======+***+=:=++++===+**|
+  |#####***++=:::=++*=::=++==:=++**|
+  |#####****++::::=++=::====::=+***|
+  +--------------------------------+
+  Range: 0.006 (linear) to 0.291 (very non-linear)
+
+  Learned Contrast Curve (Center Control Point):
+  +--------------------------------+
+  |                    .^```'''''' |
+  |                  .`            |
+  |                .`              |
+  |               -                |
+  |              `                 |
+  |            _'                  |
+  |           -                    |
+  |          ^                     |
+  |         `                      |
+  |       _'                       |
+  |      .                         |
+  |     .                          |
+  |    -                           |
+  |   -                            |
+  |  ^                             |
+  |_`                              |
+  +--------------------------------+
+  0               input            1
+```
+
+## Dynamic RGB to Grayscale color mapping
+
+This is necessary for input images with information mostly in the chrominance channel. We learn a small MLP to separate colors cleanly in grayscale
+
+<img src="testcases/patrick.png" width="378"> <img src="examples/rgb_curves_output.png" width="378">
+
+```
+Learning LAB→grayscale mapping for maximum separability (250 iterations)...
+  Architecture: LAB(3) -> Dense(16) -> ReLU -> Dense(8) -> ReLU -> Dense(1) -> Sigmoid
+  Iteration 0/250: cluster=0.0005, separate=0.2444, luma=0.0842, lr=0.000000
+  Iteration 50/250: cluster=0.0067, separate=0.0607, luma=0.0134, lr=0.009698
+  Iteration 100/250: cluster=0.0137, separate=0.0043, luma=0.0008, lr=0.007500
+  Iteration 150/250: cluster=0.0120, separate=0.0042, luma=0.0008, lr=0.004132
+  Iteration 200/250: cluster=0.0130, separate=0.0031, luma=0.0008, lr=0.001170
+  Iteration 249/250: cluster=0.0124, separate=0.0062, luma=0.0008, lr=0.000000
+LAB→grayscale learning complete.
+  Output brightness range: [0.067, 0.853]
+  Saved grayscale result to: rgb_curves_output.png
+```
+
 ## Overview
 
 Traditional ASCII art converters work by mapping pixel brightness to characters with similar visual density. This project takes a fundamentally different approach: we **optimize character placement directly** by minimizing the difference between the rendered ASCII art and the target image.

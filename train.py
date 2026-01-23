@@ -398,7 +398,7 @@ def optimize_rgb_curves(rgb_image, iterations=250, lr=0.01):
     return gray_final, model
 
 
-def optimize_contrast_curve_field(image, num_bins=64, iterations=200, lr=0.05, smoothness_weight=0.01):
+def optimize_contrast_curve_field(image, num_bins=64, iterations=200, lr=0.05, smoothness_weight=0.1):
     """
     Optimize a spatially-varying tone curve field to maximize local entropy.
     Each control point has its own tone curve, interpolated across the image.

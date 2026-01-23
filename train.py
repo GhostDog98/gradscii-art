@@ -133,6 +133,96 @@ def load_target_image(image_path):
     return img_tensor
 
 
+def optimize_contrast_curve(image, num_bins=256, iterations=500, lr=0.1):
+    """
+    Optimize a monotonic tone curve to maximize entropy of the image histogram.
+
+    Args:
+        image: (H, W) tensor with values in [0, 1]
+        num_bins: number of bins for the tone curve
+        iterations: optimization iterations
+        lr: learning rate
+
+    Returns:
+        contrast_adjusted: (H, W) tensor with adjusted contrast
+        curve: the learned tone curve for visualization
+    """
+    print(f"\nOptimizing contrast curve ({iterations} iterations)...")
+
+    # Parameterize curve as cumulative sum of positive increments (ensures monotonicity)
+    # Start with uniform increments (identity curve)
+    increments = nn.Parameter(torch.ones(num_bins, device=DEVICE) / num_bins)
+
+    optimizer = optim.Adam([increments], lr=lr)
+
+    for i in range(iterations):
+        optimizer.zero_grad()
+
+        # Build monotonic curve via cumsum of softplus(increments)
+        positive_increments = F.softplus(increments)
+        # Normalize so curve goes from 0 to 1
+        normalized_increments = positive_increments / positive_increments.sum()
+        curve = torch.cumsum(normalized_increments, dim=0)
+        curve = torch.cat([torch.zeros(1, device=DEVICE), curve])  # Prepend 0
+
+        # Apply curve to image via interpolation
+        # Quantize image to bin indices
+        img_flat = image.flatten()
+        bin_indices = (img_flat * (num_bins - 1)).clamp(0, num_bins - 1)
+
+        # Bilinear interpolation from curve
+        idx0 = torch.floor(bin_indices).long()
+        idx1 = torch.clamp(idx0 + 1, 0, num_bins)
+        weight1 = bin_indices - idx0.float()
+        weight0 = 1.0 - weight1
+
+        adjusted_flat = curve[idx0] * weight0 + curve[idx1] * weight1
+        adjusted = adjusted_flat.reshape(image.shape)
+
+        # Compute histogram (differentiable via soft binning)
+        # Create soft histogram by using distances to bin centers
+        bin_centers = torch.linspace(0, 1, num_bins, device=DEVICE)
+        # Shape: (num_pixels, num_bins)
+        distances = torch.abs(adjusted_flat.unsqueeze(1) - bin_centers.unsqueeze(0))
+        # Soft binning with small sigma for sharpness
+        sigma = 0.02
+        weights = torch.exp(-distances ** 2 / (2 * sigma ** 2))
+        histogram = weights.sum(dim=0)
+        histogram = histogram / histogram.sum()  # Normalize
+
+        # Entropy: -sum(p * log(p))
+        entropy = -(histogram * torch.log(histogram + 1e-10)).sum()
+
+        # Maximize entropy (minimize negative entropy)
+        loss = -entropy
+
+        loss.backward()
+        optimizer.step()
+
+        if i % 100 == 0 or i == iterations - 1:
+            print(f"  Iteration {i}/{iterations}: entropy={entropy.item():.4f}")
+
+    # Apply final curve
+    with torch.no_grad():
+        positive_increments = F.softplus(increments)
+        normalized_increments = positive_increments / positive_increments.sum()
+        curve_final = torch.cumsum(normalized_increments, dim=0)
+        curve_final = torch.cat([torch.zeros(1, device=DEVICE), curve_final])
+
+        img_flat = image.flatten()
+        bin_indices = (img_flat * (num_bins - 1)).clamp(0, num_bins - 1)
+        idx0 = torch.floor(bin_indices).long()
+        idx1 = torch.clamp(idx0 + 1, 0, num_bins)
+        weight1 = bin_indices - idx0.float()
+        weight0 = 1.0 - weight1
+
+        adjusted_flat = curve_final[idx0] * weight0 + curve_final[idx1] * weight1
+        adjusted_image = adjusted_flat.reshape(image.shape)
+
+    print(f"Contrast optimization complete. Entropy improved from input to output.")
+    return adjusted_image, curve_final.cpu().numpy()
+
+
 def precompute_warp_interpolation_structure(H, W):
     """Precompute fixed interpolation structure for control point warping (only depends on grid, not warp values)."""
     # Create coordinate grids for output pixels
@@ -814,6 +904,8 @@ Examples:
     # Output configuration
     parser.add_argument('--dark-mode', action='store_true',
                        help='Invert colors for dark mode (white text on black background)')
+    parser.add_argument('--optimize-contrast', action='store_true',
+                       help='Optimize tone curve to maximize histogram entropy (fixes poor contrast)')
     parser.add_argument('--save-interval', type=int, default=100,
                        help='Save intermediate results every N iterations (default: 100)')
     parser.add_argument('--output', type=str, default='output.png',
@@ -908,6 +1000,7 @@ if __name__ == "__main__":
     print(f"  Printer Font:   {PRINTER_FONT} ({PRINTER_FONT_SIZE}pt, y-offset={PRINTER_Y_OFFSET})")
     print(f"  Fallback Font:  {args.fallback_font} ({FALLBACK_FONT_SIZE}pt)")
     print(f"  Dark mode:      {args.dark_mode}")
+    print(f"  Contrast opt:   {args.optimize_contrast}")
     print()
     print("Training Hyperparameters:")
     print(f"  Iterations:     {args.iterations}")
@@ -937,6 +1030,10 @@ if __name__ == "__main__":
     # Training mode
     char_bitmaps = create_char_bitmaps()
     target_image = load_target_image(args.input_image)
+
+    # Optimize contrast curve if requested
+    if args.optimize_contrast:
+        target_image, contrast_curve = optimize_contrast_curve(target_image)
 
     result = train(
         target_image, char_bitmaps,

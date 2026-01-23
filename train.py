@@ -86,7 +86,7 @@ def load_target_image(image_path):
 
 def render_ascii(logits, char_bitmaps):
     """
-    Render ASCII art using soft character selection.
+    Render ASCII art using soft character selection (vectorized).
 
     Args:
         logits: (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS) - unnormalized scores
@@ -98,33 +98,21 @@ def render_ascii(logits, char_bitmaps):
     # Apply softmax to get character weights
     weights = torch.softmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
 
-    # Initialize output image
-    rendered = torch.zeros((IMAGE_HEIGHT, IMAGE_WIDTH), dtype=torch.float32, device=DEVICE)
+    # Vectorized rendering using einsum
+    # weights: (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
+    # char_bitmaps: (NUM_CHARS, CHAR_HEIGHT, CHAR_WIDTH)
+    # Result: (GRID_HEIGHT, GRID_WIDTH, CHAR_HEIGHT, CHAR_WIDTH)
+    rendered_grid = torch.einsum('ijk,khw->ijhw', weights, char_bitmaps)
 
-    # For each grid position, render weighted combination of characters
-    for i in range(GRID_HEIGHT):
-        for j in range(GRID_WIDTH):
-            # Get weights for this position
-            w = weights[i, j]  # (NUM_CHARS,)
-
-            # Compute weighted sum of character bitmaps
-            char_weighted = torch.sum(
-                w.view(NUM_CHARS, 1, 1) * char_bitmaps,
-                dim=0
-            )  # (CHAR_HEIGHT, CHAR_WIDTH)
-
-            # Place in output image
-            y_start = i * CHAR_HEIGHT
-            y_end = (i + 1) * CHAR_HEIGHT
-            x_start = j * CHAR_WIDTH
-            x_end = (j + 1) * CHAR_WIDTH
-
-            rendered[y_start:y_end, x_start:x_end] = char_weighted
+    # Reshape to final image by interleaving the grid
+    # (GRID_HEIGHT, GRID_WIDTH, CHAR_HEIGHT, CHAR_WIDTH) -> (IMAGE_HEIGHT, IMAGE_WIDTH)
+    rendered = rendered_grid.permute(0, 2, 1, 3).contiguous()  # (GRID_HEIGHT, CHAR_HEIGHT, GRID_WIDTH, CHAR_WIDTH)
+    rendered = rendered.view(IMAGE_HEIGHT, IMAGE_WIDTH)
 
     return rendered
 
 
-def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interval=10, warmup_iterations=50):
+def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interval=100, warmup_iterations=50):
     """Train ASCII art using gradient descent with cosine learning rate schedule."""
 
     # Clear and create steps directory
@@ -275,7 +263,7 @@ if __name__ == "__main__":
     target_image = load_target_image(input_image_path)
 
     # Train
-    logits = train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, warmup_iterations=50)
+    logits = train(target_image, char_bitmaps, num_iterations=10000, lr=0.01, warmup_iterations=500)
 
     # Save final results
     save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt")

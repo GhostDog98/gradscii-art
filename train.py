@@ -12,8 +12,12 @@ CHAR_WIDTH = 12
 CHAR_HEIGHT = 24
 GRID_WIDTH = 42
 GRID_HEIGHT = 21
+ROW_GAP = 6  # Gap between rows (receipt printer spacing)
 IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH  # 504
-IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT  # 504
+IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT + ROW_GAP * (GRID_HEIGHT - 1)  # 504 + 120 = 624
+
+# Character encoding (cp437 for receipt printers, ascii for standard text)
+ENCODING = 'cp437'
 
 # Device configuration
 if torch.backends.mps.is_available():
@@ -26,37 +30,76 @@ else:
     DEVICE = torch.device("cpu")
     print("Using CPU device")
 
-# Printable ASCII characters (space to ~)
-CHARS = ''.join(chr(i) for i in range(32, 127))
+# Character set based on encoding
+if ENCODING == 'cp437':
+    CHARS = ''.join(bytes([i]).decode('cp437') for i in range(32, 256))
+else:
+    # Standard 7-bit ASCII
+    CHARS = ''.join(chr(i) for i in range(32, 127))
+
+# Ban certain characters (block characters that feel like cheating)
+BANNED_CHARS = ['█', '▄', '▌', '▐', '▀', '■']
+CHARS = ''.join(c for c in CHARS if c not in BANNED_CHARS)
+
 NUM_CHARS = len(CHARS)
 
-print(f"Using {NUM_CHARS} characters: {CHARS[:20]}...")
+print(f"Using {NUM_CHARS} characters ({ENCODING}): {CHARS[:20]}...")
 
 
 def create_char_bitmaps():
-    """Create a lookup table of character bitmaps using Monaco font."""
+    """Create a lookup table of character bitmaps with font fallback."""
     print("Creating character bitmap LUT...")
 
-    # Try to load Monaco font
+    # Try to load printer font (bitArray-A2.ttf) for 7-bit ASCII
+    printer_font = None
     try:
-        font = ImageFont.truetype("Monaco.ttf", 18)
+        printer_font = ImageFont.truetype("./bitArray-A2.ttf", 24)
+        print("Loaded printer font: bitArray-A2.ttf (24pt)")
     except:
+        print("Printer font not found, using fallback for all characters")
+
+    # Load fallback font (Menlo for extended ASCII)
+    fallback_font = None
+    fallback_paths = [
+        "/System/Library/Fonts/Supplemental/Menlo.ttc",
+        "/System/Library/Fonts/Monaco.dfont",
+    ]
+    for path in fallback_paths:
         try:
-            font = ImageFont.truetype("/System/Library/Fonts/Monaco.dfont", 18)
+            fallback_font = ImageFont.truetype(path, 18)
+            print(f"Loaded fallback font: {path} (18pt)")
+            break
         except:
-            # Fallback to default monospace
-            print("Warning: Monaco not found, using default font")
-            font = ImageFont.load_default()
+            continue
+
+    if fallback_font is None:
+        print("Warning: No fallback font found, using default")
+        fallback_font = ImageFont.load_default()
 
     # Render each character to a bitmap
     bitmaps = []
-    for char in CHARS:
+    printer_count = 0
+    fallback_count = 0
+
+    for idx, char in enumerate(CHARS):
+        # Use printer font for 7-bit ASCII, fallback for extended
+        char_code = ord(char)
+
+        if printer_font is not None and char_code < 127:
+            # Use printer font with Y offset 4
+            font = printer_font
+            y_offset = 4
+            printer_count += 1
+        else:
+            # Use fallback font with Y offset 0
+            font = fallback_font
+            y_offset = 0
+            fallback_count += 1
+
         # Create image for single character
         img = Image.new('L', (CHAR_WIDTH, CHAR_HEIGHT), 255)  # White background
         draw = ImageDraw.Draw(img)
-
-        # Draw character in black
-        draw.text((0, 0), char, font=font, fill=0)
+        draw.text((0, y_offset), char, font=font, fill=0)
 
         # Convert to numpy array and normalize to [0, 1]
         bitmap = np.array(img).astype(np.float32) / 255.0
@@ -65,6 +108,7 @@ def create_char_bitmaps():
     # Stack into tensor: (NUM_CHARS, CHAR_HEIGHT, CHAR_WIDTH)
     bitmaps_tensor = torch.tensor(np.stack(bitmaps), dtype=torch.float32).to(DEVICE)
     print(f"Character bitmaps shape: {bitmaps_tensor.shape}")
+    print(f"Using printer font: {printer_count} chars, fallback font: {fallback_count} chars")
 
     return bitmaps_tensor
 
@@ -73,11 +117,21 @@ def load_target_image(image_path):
     """Load and preprocess target image."""
     img = Image.open(image_path).convert('L')
 
-    # Resize to match our grid dimensions
-    img = img.resize((IMAGE_WIDTH, IMAGE_HEIGHT), Image.LANCZOS)
+    # Resize to content dimensions (without gap space)
+    content_height = CHAR_HEIGHT * GRID_HEIGHT  # 504
+    img = img.resize((IMAGE_WIDTH, content_height), Image.LANCZOS)
 
-    # Convert to tensor and normalize to [0, 1]
+    # Convert to array and normalize to [0, 1]
     img_array = np.array(img).astype(np.float32) / 255.0
+
+    # Pad to match IMAGE_HEIGHT if we have row gaps (split padding top and bottom)
+    if IMAGE_HEIGHT > content_height:
+        padding = IMAGE_HEIGHT - content_height
+        pad_top = padding // 2
+        pad_bottom = padding - pad_top
+        img_array = np.pad(img_array, ((pad_top, pad_bottom), (0, 0)), mode='constant', constant_values=1.0)  # White padding
+
+    # Convert to tensor
     img_tensor = torch.tensor(img_array, dtype=torch.float32).to(DEVICE)
 
     print(f"Target image shape: {img_tensor.shape}")
@@ -93,7 +147,7 @@ def render_ascii(logits, char_bitmaps):
         char_bitmaps: (NUM_CHARS, CHAR_HEIGHT, CHAR_WIDTH) - character bitmaps
 
     Returns:
-        rendered: (IMAGE_HEIGHT, IMAGE_WIDTH) - rendered image
+        rendered: (IMAGE_HEIGHT, IMAGE_WIDTH) - rendered image with row gaps
     """
     # Apply softmax to get character weights
     weights = torch.softmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
@@ -104,10 +158,24 @@ def render_ascii(logits, char_bitmaps):
     # Result: (GRID_HEIGHT, GRID_WIDTH, CHAR_HEIGHT, CHAR_WIDTH)
     rendered_grid = torch.einsum('ijk,khw->ijhw', weights, char_bitmaps)
 
-    # Reshape to final image by interleaving the grid
-    # (GRID_HEIGHT, GRID_WIDTH, CHAR_HEIGHT, CHAR_WIDTH) -> (IMAGE_HEIGHT, IMAGE_WIDTH)
-    rendered = rendered_grid.permute(0, 2, 1, 3).contiguous()  # (GRID_HEIGHT, CHAR_HEIGHT, GRID_WIDTH, CHAR_WIDTH)
-    rendered = rendered.view(IMAGE_HEIGHT, IMAGE_WIDTH)
+    # Reshape to image with row gaps
+    # (GRID_HEIGHT, GRID_WIDTH, CHAR_HEIGHT, CHAR_WIDTH) -> (GRID_HEIGHT, CHAR_HEIGHT, GRID_WIDTH, CHAR_WIDTH)
+    rendered_grid = rendered_grid.permute(0, 2, 1, 3).contiguous()
+    # -> (GRID_HEIGHT, CHAR_HEIGHT, IMAGE_WIDTH)
+    rendered_grid = rendered_grid.view(GRID_HEIGHT, CHAR_HEIGHT, IMAGE_WIDTH)
+
+    if ROW_GAP > 0:
+        # Create output with gaps (white = 1.0)
+        rendered = torch.ones((IMAGE_HEIGHT, IMAGE_WIDTH), dtype=torch.float32, device=DEVICE)
+
+        # Place each row with gaps
+        for i in range(GRID_HEIGHT):
+            y_start = i * (CHAR_HEIGHT + ROW_GAP)
+            y_end = y_start + CHAR_HEIGHT
+            rendered[y_start:y_end, :] = rendered_grid[i]
+    else:
+        # No gaps, just reshape
+        rendered = rendered_grid.view(IMAGE_HEIGHT, IMAGE_WIDTH)
 
     return rendered
 
@@ -181,9 +249,9 @@ def save_result(logits, char_bitmaps, output_path="output.png", text_path="outpu
     # Get discrete character selection for text file
     char_indices = torch.argmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH) - keep on device
 
-    # Save as text file
+    # Save as text file with specified encoding
     char_indices_cpu = char_indices.cpu()
-    with open(text_path, 'w') as f:
+    with open(text_path, 'w', encoding=ENCODING) as f:
         for i in range(GRID_HEIGHT):
             line = ''.join(CHARS[char_indices_cpu[i, j].item()] for j in range(GRID_WIDTH))
             f.write(line + '\n')

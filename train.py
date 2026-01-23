@@ -11,9 +11,9 @@ import shutil
 CHAR_WIDTH = 12
 CHAR_HEIGHT = 24
 GRID_WIDTH = 42
-GRID_HEIGHT = 42
+GRID_HEIGHT = 21
 IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH  # 504
-IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT  # 1008
+IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT  # 504
 
 # Device configuration
 if torch.backends.mps.is_available():

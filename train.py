@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
@@ -186,8 +187,8 @@ def render_ascii(logits, char_bitmaps, temperature=1.0, use_gumbel=False):
 
 
 def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interval=100, warmup_iterations=50, diversity_weight=0.01,
-          use_gumbel=True, temp_start=1.0, temp_end=0.01, protect_whitespace=True):
-    """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, and Gumbel-softmax."""
+          use_gumbel=True, temp_start=1.0, temp_end=0.01, protect_whitespace=True, multiscale_weight=0.0, multiscale_kernel=4):
+    """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, multiscale perceptual loss, and Gumbel-softmax."""
 
     # Clear and create steps directory
     if os.path.exists("steps"):
@@ -240,6 +241,23 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         # Compute reconstruction loss
         recon_loss = criterion(rendered, target_image)
 
+        # Compute multiscale perceptual loss (dithering effect)
+        if multiscale_weight != 0.0:
+            # Add batch and channel dimensions for pooling
+            rendered_4d = rendered.unsqueeze(0).unsqueeze(0)
+            target_4d = target_image.unsqueeze(0).unsqueeze(0)
+
+            # Downsample both rendered and target with overlapping patches
+            # Use stride = kernel_size // 2 for 50% overlap
+            stride = max(1, multiscale_kernel // 2)
+            rendered_small = F.avg_pool2d(rendered_4d, kernel_size=multiscale_kernel, stride=stride).squeeze()
+            target_small = F.avg_pool2d(target_4d, kernel_size=multiscale_kernel, stride=stride).squeeze()
+
+            # Loss on downsampled version
+            multiscale_loss = criterion(rendered_small, target_small)
+        else:
+            multiscale_loss = torch.tensor(0.0).to(DEVICE)
+
         if diversity_weight != 0.0:
             # Compute diversity loss (entropy of character usage, excluding whitespace)
             weights = torch.softmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
@@ -265,7 +283,7 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
             diversity_loss = torch.tensor(0.0).to(DEVICE)
 
         # Total loss
-        loss = recon_loss + diversity_weight * diversity_loss
+        loss = recon_loss + multiscale_weight * multiscale_loss + diversity_weight * diversity_loss
 
         # Backprop
         loss.backward()
@@ -273,12 +291,16 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         scheduler.step()
 
         # Update progress bar
-        pbar.set_postfix({
+        postfix = {
             'recon': f'{recon_loss.item():.4f}',
-            'div': f'{diversity_loss.item():.4f}',
             'lr': f'{current_lr:.4f}',
             'temp': f'{temperature:.4f}'
-        })
+        }
+        if multiscale_weight != 0.0:
+            postfix['ms'] = f'{multiscale_loss.item():.4f}'
+        if diversity_weight != 0.0:
+            postfix['div'] = f'{diversity_loss.item():.4f}'
+        pbar.set_postfix(postfix)
 
         # Save intermediate results
         if iteration % save_interval == 0 or iteration == num_iterations - 1:
@@ -432,6 +454,10 @@ Examples:
                        help='Weight for diversity loss encouraging varied character usage (default: 0.01, set to 0 to disable)')
     parser.add_argument('--penalize-whitespace', action='store_true',
                        help='Include whitespace in diversity penalty (default: whitespace is protected)')
+    parser.add_argument('--multiscale-weight', type=float, default=0.5,
+                       help='Weight for multiscale perceptual loss (dithering effect) - optimizes for how it looks when downsampled (default: 0.5, try 0.0-1.0)')
+    parser.add_argument('--multiscale-kernel', type=int, default=4,
+                       help='Downsampling kernel size for multiscale loss (default: 4, simulates viewing distance)')
 
     # Gumbel-softmax parameters
     parser.add_argument('--no-gumbel', action='store_true',
@@ -539,7 +565,8 @@ if __name__ == "__main__":
     print(f"  Iterations:     {args.iterations}")
     print(f"  Learning Rate:  {args.lr}")
     print(f"  Warmup:         {args.warmup} iterations")
-    print(f"  Diversity:      {args.diversity_weight} (whitespace {'protected' if not args.penalize_whitespace else ' '})")
+    print(f"  Diversity:      {args.diversity_weight} (whitespace {'protected' if not args.penalize_whitespace else 'included'})")
+    print(f"  Multiscale:     {args.multiscale_weight} (kernel={args.multiscale_kernel})")
     print(f"  Gumbel-softmax: {'Enabled' if not args.no_gumbel else 'Disabled'}")
     if not args.no_gumbel:
         print(f"    Temperature:  {args.temp_start} → {args.temp_end}")
@@ -572,7 +599,9 @@ if __name__ == "__main__":
         use_gumbel=not args.no_gumbel,
         temp_start=args.temp_start,
         temp_end=args.temp_end,
-        protect_whitespace=not args.penalize_whitespace
+        protect_whitespace=not args.penalize_whitespace,
+        multiscale_weight=args.multiscale_weight,
+        multiscale_kernel=args.multiscale_kernel
     )
 
     save_result(

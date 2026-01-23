@@ -16,6 +16,15 @@ Is it overkill? Yes but fuck it we ball
 
 ---
 
+Demonstration of psychovisual tuning
+
+![./examples/tuning.png](./examples/tuning.png)
+
+- Diversity loss weight: penalty for using the same characters over and over again (adds noise = looks better. less banding etc)
+- Multiscale loss weight: also downscale the learned and target image and compute loss over that too (makes it do dithering)
+
+---
+
 Default settings
 
 <img src="testcases/test2.png" width="378"> ![Training progress](./examples/training_progress1.gif)
@@ -69,12 +78,13 @@ The key insight is making character selection **differentiable** through softmax
 - **CP437 Support**: Full support for IBM PC Code Page 437 (Epson receipt printers)
 - **Multiple Presets**: Pre-configured settings for receipt printers and Discord text blocks
 - **Vectorized Rendering**: Fast GPU-accelerated character composition
+- **Font Fallback**: Uses printer fonts for ASCII, fallback fonts for extended characters
 
-### Artistic Options
+### Artistic/psychovisual Options
 
 - **Row Gap Support**: Simulates printer spacing for realistic output
-- **Font Fallback**: Uses printer fonts for ASCII, fallback fonts for extended characters
 - **Character Diversity Penalty**: Encourage varied character usage by incorporating into loss function
+- **Downscaled (multiscale) reconstruction loss**: Encourage dithering by also comparing if downscaled image looks good too. Done with a quick convolution
 
 ### Learning Techniques
 

@@ -61,7 +61,7 @@ Without warping enabled (only scaling and translation), we struggle to learn an 
 
 ![./examples/learn_alignment.gif](./examples/learn_alignment.gif)
 
-With warping enabled, we successfully learn significant part of the identity mapping. This is not an easy task!
+With warping enabled, we successfully learn significant part of the identity mapping. This is not easy!
 
 ![./examples/learn_alignment2.gif](./examples/learn_alignment2.gif)
 
@@ -81,9 +81,9 @@ Pay attention to the lips, bottom edges of the eyes, bottom of the chin, and eye
 
 ![./examples/learn_alignment8.gif](./examples/learn_alignment8.gif)
 
-## Dynamic contrast
+## Dynamic contrast (and dark mode)
 
-Learnable contrast curve per each point on the character grid is bilinearly interpolated.
+Learnable contrast curve per each point on the character grid is bilinearly interpolated. Dark mode is also supported as shown in this image
 
 ![./examples/learn_contrast.gif](./examples/learn_contrast.gif)
 

@@ -55,19 +55,27 @@ Identity mapping test
 
 ## Warping
 
-Learnable affine transformation (scale+translate), warp matrix
+Learnable affine transformation (scale+translate), warp matrix. Is this totally overkill? Yes! Does it make results significantly better? Yes!
+
+Without warping enabled (only scaling and translation), we struggle to learn an identity mapping because the input raster are misaligned with the character grid.
 
 ![./examples/learn_alignment.gif](./examples/learn_alignment.gif)
 
+With warping enabled, we successfully learn significant part of the identity mapping. This is not an easy task!
+
 ![./examples/learn_alignment2.gif](./examples/learn_alignment2.gif)
+
+Warping significantly improves reconstruction loss by leveraging "row gaps" as part of the pattern allowing for cleaner horizontal and vertical edges. In practice even substantial warping is not noticeable in the final result.
 
 ![./examples/learn_alignment3.gif](./examples/learn_alignment3.gif)
 
-![./examples/learn_alignment4.gif](./examples/learn_alignment4.gif)
+![./examples/learn_alignment4.gif](./examples/learn_alignment4.gif) 
 
 ![./examples/learn_alignment5.gif](./examples/learn_alignment5.gif)
 
 ![./examples/learn_alignment6.gif](./examples/learn_alignment6.gif)
+
+Pay attention to the lips, bottom edges of the eyes, bottom of the chin, and eyebrows. They become aligned with the character grid so the row gaps can be used to create clean horizontal edges. Pay attention to the split in the middle of the bangs, the right side of the face near the temple, and various vertical lines in the hair. This becomes aligned with a column boundary to create a clean vertical edge.
 
 ![./examples/learn_alignment7.gif](./examples/learn_alignment7.gif)
 
@@ -79,7 +87,7 @@ Learnable contrast curve per each point on the character grid is bilinearly inte
 
 ![./examples/learn_contrast.gif](./examples/learn_contrast.gif)
 
-Yes this is completely overkill and it's mostly an artistic effect to add a fuck ton of shading
+Yes this is completely overkill and it's mostly an artistic effect to add a fuck ton of shading like those old 90s ansi files.
 
 ```
 Curve Non-linearity Map (deviation from identity):                                                                09:43:06 [15/56867]
@@ -127,7 +135,7 @@ Curve Non-linearity Map (deviation from identity):                              
 
 ## Dynamic RGB to Grayscale color mapping
 
-This is necessary for input images with information mostly in the chrominance channel. We learn a small MLP to separate colors cleanly in grayscale
+This is necessary for input images with information mostly in the chrominance channel. We learn a small MLP to separate colors cleanly in grayscale. Pay attention to the color of Patrick (orange) and the sweater (purple). These have similar luminance, so without color mapping, Patrick's face is indistinguishable from his body. Patrick's eyes are also difficult to distinguish from his face without discontinuous color mapping.
 
 <img src="testcases/patrick.png" width="378"> <img src="examples/rgb_curves_output.png" width="378">
 

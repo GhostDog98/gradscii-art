@@ -25,8 +25,8 @@ BANNED_CHARS = ['`', '\\']
 PRINTER_FONT = "./fonts/bitArray-A2.ttf"
 PRINTER_FONT_SIZE = 24
 PRINTER_Y_OFFSET = 4
-FALLBACK_FONTS = ["/System/Library/Fonts/Supplemental/Menlo.ttc", "/System/Library/Fonts/Monaco.dfont"]
-FALLBACK_FONT_SIZE = 18
+FALLBACK_FONTS = ["/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Monaco.ttf"]
+FALLBACK_FONT_SIZE = 24
 
 # Device configuration
 if torch.backends.mps.is_available():
@@ -86,9 +86,9 @@ def create_char_bitmaps():
             y_offset = printer_y_offset
             printer_count += 1
         else:
-            # Use fallback font with Y offset 0
+            # Use fallback font with Y offset -5
             font = fallback_font
-            y_offset = 0
+            y_offset = -5
             fallback_count += 1
 
         # Create image for single character
@@ -147,7 +147,6 @@ def load_target_image(image_path, keep_rgb=False):
     # Convert to tensor
     img_tensor = torch.tensor(img_array, dtype=torch.float32, device=DEVICE)
 
-    print(f"Target image shape: {img_tensor.shape}")
     return img_tensor
 
 
@@ -658,14 +657,15 @@ def precompute_warp_interpolation_structure(H, W):
 def apply_spatially_varying_transform(image, tx_global, ty_global, warp_tx, warp_ty, scale_x, scale_y):
     """
     Apply spatially-varying transformation using precomputed global WARP_INTERP_CACHE.
+    Always expects batched inputs.
 
     Args:
-        image: (H, W) tensor
-        tx_global, ty_global: scalar global translation
-        warp_tx, warp_ty: (GRID_HEIGHT+1, GRID_WIDTH+1) local warp offsets
-        scale_x, scale_y: scalar scale factors
+        image: (B, H, W) tensor
+        tx_global, ty_global: (B,) global translation
+        warp_tx, warp_ty: (B, GRID_HEIGHT+1, GRID_WIDTH+1) local warp offsets
+        scale_x, scale_y: (B,) scale factors
     """
-    H, W = image.shape
+    B, H, W = image.shape
 
     # Unpack global cached values
     cy0, cy1, cx0, cx1 = WARP_INTERP_CACHE['cy0'], WARP_INTERP_CACHE['cy1'], WARP_INTERP_CACHE['cx0'], WARP_INTERP_CACHE['cx1']
@@ -673,24 +673,33 @@ def apply_spatially_varying_transform(image, tx_global, ty_global, warp_tx, warp
     y_out, x_out = WARP_INTERP_CACHE['y_out'], WARP_INTERP_CACHE['x_out']
     center_y, center_x = WARP_INTERP_CACHE['center_y'], WARP_INTERP_CACHE['center_x']
 
-    # Bilinearly interpolate local warp offsets (this is the only dynamic part)
+    # Bilinearly interpolate local warp offsets (batched)
+    # warp_tx/ty: (B, GRID_HEIGHT+1, GRID_WIDTH+1)
+    # cy0, cx0, etc: (H, W)
+    # Result: (B, H, W)
     tx_warp_interp = (
-        warp_tx[cy0, cx0] * wy0 * wx0 +
-        warp_tx[cy0, cx1] * wy0 * wx1 +
-        warp_tx[cy1, cx0] * wy1 * wx0 +
-        warp_tx[cy1, cx1] * wy1 * wx1
+        warp_tx[:, cy0, cx0] * wy0 * wx0 +
+        warp_tx[:, cy0, cx1] * wy0 * wx1 +
+        warp_tx[:, cy1, cx0] * wy1 * wx0 +
+        warp_tx[:, cy1, cx1] * wy1 * wx1
     )
     ty_warp_interp = (
-        warp_ty[cy0, cx0] * wy0 * wx0 +
-        warp_ty[cy0, cx1] * wy0 * wx1 +
-        warp_ty[cy1, cx0] * wy1 * wx0 +
-        warp_ty[cy1, cx1] * wy1 * wx1
+        warp_ty[:, cy0, cx0] * wy0 * wx0 +
+        warp_ty[:, cy0, cx1] * wy0 * wx1 +
+        warp_ty[:, cy1, cx0] * wy1 * wx0 +
+        warp_ty[:, cy1, cx1] * wy1 * wx1
     )
+
+    # Reshape scalars for broadcasting: (B,) -> (B, 1, 1)
+    tx_global = tx_global.view(B, 1, 1)
+    ty_global = ty_global.view(B, 1, 1)
+    scale_x = scale_x.view(B, 1, 1)
+    scale_y = scale_y.view(B, 1, 1)
 
     # Apply inverse transformation to find source coordinates
     # Order: (1) scale from center, (2) global translate, (3) local warp
-    y_coords = (y_out - center_y) / scale_y + center_y - ty_global - ty_warp_interp
-    x_coords = (x_out - center_x) / scale_x + center_x - tx_global - tx_warp_interp
+    y_coords = (y_out - center_y) / scale_y + center_y - ty_global - ty_warp_interp  # (B, H, W)
+    x_coords = (x_out - center_x) / scale_x + center_x - tx_global - tx_warp_interp  # (B, H, W)
 
     # Get integer coordinates for 4 neighbors
     y0 = torch.floor(y_coords).long()
@@ -716,11 +725,14 @@ def apply_spatially_varying_transform(image, tx_global, ty_global, warp_tx, warp
     x0_safe = torch.clamp(x0, 0, W - 1)
     x1_safe = torch.clamp(x1, 0, W - 1)
 
+    # Create batch indices for advanced indexing
+    batch_idx = torch.arange(B, device=DEVICE).view(B, 1, 1).expand(B, H, W)
+
     # Gather 4 neighbors with validity masks (white padding for out of bounds)
-    val_00 = torch.where(valid_y0 & valid_x0, image[y0_safe, x0_safe], torch.ones(1, device=DEVICE))
-    val_01 = torch.where(valid_y0 & valid_x1, image[y0_safe, x1_safe], torch.ones(1, device=DEVICE))
-    val_10 = torch.where(valid_y1 & valid_x0, image[y1_safe, x0_safe], torch.ones(1, device=DEVICE))
-    val_11 = torch.where(valid_y1 & valid_x1, image[y1_safe, x1_safe], torch.ones(1, device=DEVICE))
+    val_00 = torch.where(valid_y0 & valid_x0, image[batch_idx, y0_safe, x0_safe], torch.ones(1, device=DEVICE))
+    val_01 = torch.where(valid_y0 & valid_x1, image[batch_idx, y0_safe, x1_safe], torch.ones(1, device=DEVICE))
+    val_10 = torch.where(valid_y1 & valid_x0, image[batch_idx, y1_safe, x0_safe], torch.ones(1, device=DEVICE))
+    val_11 = torch.where(valid_y1 & valid_x1, image[batch_idx, y1_safe, x1_safe], torch.ones(1, device=DEVICE))
 
     # Bilinear interpolation
     transformed = (
@@ -809,20 +821,22 @@ def apply_transform(image, tx, ty, scale_x, scale_y):
 def render_ascii(logits, char_bitmaps, temperature=1.0, use_gumbel=False):
     """
     Render ASCII art using soft character selection (vectorized).
+    Always expects batched input.
 
     Args:
-        logits: (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS) - unnormalized scores
+        logits: (B, GRID_HEIGHT, GRID_WIDTH, NUM_CHARS) - unnormalized scores
         char_bitmaps: (NUM_CHARS, CHAR_HEIGHT, CHAR_WIDTH) - character bitmaps
         temperature: Temperature for softmax (lower = more discrete)
         use_gumbel: Whether to add Gumbel noise
 
     Returns:
-        rendered: (IMAGE_HEIGHT, IMAGE_WIDTH) - rendered image with row gaps
+        rendered: (B, IMAGE_HEIGHT, IMAGE_WIDTH) - rendered images with row gaps
     """
+    B = logits.shape[0]
+
     # Apply Gumbel noise if requested
     if use_gumbel and logits.requires_grad:  # Only during training
         # Sample Gumbel noise: g = -log(-log(u)) where u ~ Uniform(0,1)
-        # Ensure random sampling happens on device (MPS/CUDA)
         u = torch.rand_like(logits, device=logits.device)
         gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
         logits_with_noise = logits + gumbel_noise
@@ -830,32 +844,32 @@ def render_ascii(logits, char_bitmaps, temperature=1.0, use_gumbel=False):
         logits_with_noise = logits
 
     # Apply temperature-scaled softmax to get character weights
-    weights = torch.softmax(logits_with_noise / temperature, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
+    weights = torch.softmax(logits_with_noise / temperature, dim=-1)  # (B, GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
 
     # Vectorized rendering using einsum
-    # weights: (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
+    # weights: (B, GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
     # char_bitmaps: (NUM_CHARS, CHAR_HEIGHT, CHAR_WIDTH)
-    # Result: (GRID_HEIGHT, GRID_WIDTH, CHAR_HEIGHT, CHAR_WIDTH)
-    rendered_grid = torch.einsum('ijk,khw->ijhw', weights, char_bitmaps)
+    # Result: (B, GRID_HEIGHT, GRID_WIDTH, CHAR_HEIGHT, CHAR_WIDTH)
+    rendered_grid = torch.einsum('bijk,khw->bijhw', weights, char_bitmaps)
 
     # Reshape to image with row gaps
-    # (GRID_HEIGHT, GRID_WIDTH, CHAR_HEIGHT, CHAR_WIDTH) -> (GRID_HEIGHT, CHAR_HEIGHT, GRID_WIDTH, CHAR_WIDTH)
-    rendered_grid = rendered_grid.permute(0, 2, 1, 3).contiguous()
-    # -> (GRID_HEIGHT, CHAR_HEIGHT, IMAGE_WIDTH)
-    rendered_grid = rendered_grid.view(GRID_HEIGHT, CHAR_HEIGHT, IMAGE_WIDTH)
+    # (B, GRID_HEIGHT, GRID_WIDTH, CHAR_HEIGHT, CHAR_WIDTH) -> (B, GRID_HEIGHT, CHAR_HEIGHT, GRID_WIDTH, CHAR_WIDTH)
+    rendered_grid = rendered_grid.permute(0, 1, 3, 2, 4).contiguous()
+    # -> (B, GRID_HEIGHT, CHAR_HEIGHT, IMAGE_WIDTH)
+    rendered_grid = rendered_grid.view(B, GRID_HEIGHT, CHAR_HEIGHT, IMAGE_WIDTH)
 
     if ROW_GAP > 0:
         # Create output with gaps (white = 1.0)
-        rendered = torch.ones((IMAGE_HEIGHT, IMAGE_WIDTH), dtype=torch.float32, device=DEVICE)
+        rendered = torch.ones((B, IMAGE_HEIGHT, IMAGE_WIDTH), dtype=torch.float32, device=DEVICE)
 
         # Place each row with gaps
         for i in range(GRID_HEIGHT):
             y_start = i * (CHAR_HEIGHT + ROW_GAP)
             y_end = y_start + CHAR_HEIGHT
-            rendered[y_start:y_end, :] = rendered_grid[i]
+            rendered[:, y_start:y_end, :] = rendered_grid[:, i]
     else:
         # No gaps, just reshape
-        rendered = rendered_grid.view(IMAGE_HEIGHT, IMAGE_WIDTH)
+        rendered = rendered_grid.view(B, IMAGE_HEIGHT, IMAGE_WIDTH)
 
     return rendered
 
@@ -864,36 +878,41 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
           use_gumbel=True, temp_start=1.0, temp_end=0.01, protect_whitespace=True, multiscale_weight=0.0, multiscale_kernel=4,
           optimize_alignment=False, alignment_lr=0.01, warp_reg_weight=0.01, dark_mode=False,
           prev_alignment_params=None, temporal_weight=0.0):
-    """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, multiscale perceptual loss, learnable spatial alignment, and Gumbel-softmax."""
+    """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, multiscale perceptual loss, learnable spatial alignment, and Gumbel-softmax.
+    Always expects batched input where batch dim = temporal/frame dim.
+    prev_alignment_params: Optional tuple of (tx_base, ty_base, tx_warp, ty_warp, sx, sy) from previous batch for temporal continuity."""
 
     # Clear and create steps directory
     if os.path.exists("steps"):
         shutil.rmtree("steps")
     os.makedirs("steps")
 
+    # Get batch size (number of frames)
+    B = target_image.shape[0]
+
     # Initialize logits randomly
     logits = nn.Parameter(
-        torch.randn(GRID_HEIGHT, GRID_WIDTH, NUM_CHARS, device=DEVICE) * 0.01
+        torch.randn(B, GRID_HEIGHT, GRID_WIDTH, NUM_CHARS, device=DEVICE) * 0.01
     )
 
     # Learnable spatial transformation: global shift + per-control-point warping
     if optimize_alignment:
-        # Global translation (shifts entire image)
-        translation_x = nn.Parameter(torch.zeros(1, device=DEVICE))
-        translation_y = nn.Parameter(torch.zeros(1, device=DEVICE))
+        # Global translation (shifts entire image) - batched for each frame
+        translation_x = nn.Parameter(torch.zeros(B, device=DEVICE))
+        translation_y = nn.Parameter(torch.zeros(B, device=DEVICE))
 
-        # Control points at corners of character cells: (GRID_HEIGHT+1, GRID_WIDTH+1)
+        # Control points at corners of character cells: (B, GRID_HEIGHT+1, GRID_WIDTH+1)
         # Local warping on top of global shift
-        control_tx = nn.Parameter(torch.zeros(GRID_HEIGHT + 1, GRID_WIDTH + 1, device=DEVICE))
-        control_ty = nn.Parameter(torch.zeros(GRID_HEIGHT + 1, GRID_WIDTH + 1, device=DEVICE))
+        control_tx = nn.Parameter(torch.zeros(B, GRID_HEIGHT + 1, GRID_WIDTH + 1, device=DEVICE))
+        control_ty = nn.Parameter(torch.zeros(B, GRID_HEIGHT + 1, GRID_WIDTH + 1, device=DEVICE))
 
-        # Global scale (same for entire image)
-        scale_x_param = nn.Parameter(torch.zeros(1, device=DEVICE))  # sigmoid -> [0.9, 1.2]
-        scale_y_param = nn.Parameter(torch.zeros(1, device=DEVICE))
+        # Global scale (same for entire image) - batched for each frame
+        scale_x_param = nn.Parameter(torch.zeros(B, device=DEVICE))  # sigmoid -> [0.9, 1.2]
+        scale_y_param = nn.Parameter(torch.zeros(B, device=DEVICE))
 
         optimizer = optim.AdamW([
             {'params': [logits], 'lr': lr},
-            {'params': [control_tx, control_ty], 'lr': alignment_lr}
+            {'params': [translation_x, translation_y, scale_x_param, scale_y_param, control_tx, control_ty], 'lr': alignment_lr}
         ])
     else:
         translation_x = None
@@ -923,7 +942,7 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
     print(f"Gumbel-softmax: {use_gumbel}, Temperature: {temp_start} -> {temp_end}")
     if optimize_alignment:
         print(f"Spatial alignment: Global shift + deformation field ({GRID_HEIGHT+1}x{GRID_WIDTH+1} = {(GRID_HEIGHT+1)*(GRID_WIDTH+1)} control points)")
-        print(f"  Global translation ±{CHAR_WIDTH/2:.1f}px H/V + per-control-point warp ±{CHAR_WIDTH/2:.1f}px H/V, scale 0.9-1.25x")
+        print(f"  Global translation ±{CHAR_WIDTH/2:.1f}px H/V + per-control-point warp ±{CHAR_WIDTH/2:.1f}px H/V, scale 0.9-1.2x")
 
     pbar = tqdm(range(num_iterations))
     for iteration in pbar:
@@ -974,15 +993,15 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
 
         # Compute multiscale perceptual loss (dithering effect)
         if multiscale_weight != 0.0:
-            # Add batch and channel dimensions for pooling
-            rendered_4d = rendered_cmp.unsqueeze(0).unsqueeze(0)
-            target_4d = target_cmp.unsqueeze(0).unsqueeze(0)
+            # Add channel dimension for pooling (already batched: B, H, W)
+            rendered_4d = rendered_cmp.unsqueeze(1)  # (B, 1, H, W)
+            target_4d = target_cmp.unsqueeze(1)
 
             # Downsample both rendered and target with overlapping patches
             # Use stride = kernel_size // 2 for 50% overlap
             stride = max(1, multiscale_kernel // 2)
-            rendered_small = F.avg_pool2d(rendered_4d, kernel_size=multiscale_kernel, stride=stride).squeeze()
-            target_small = F.avg_pool2d(target_4d, kernel_size=multiscale_kernel, stride=stride).squeeze()
+            rendered_small = F.avg_pool2d(rendered_4d, kernel_size=multiscale_kernel, stride=stride).squeeze(1)
+            target_small = F.avg_pool2d(target_4d, kernel_size=multiscale_kernel, stride=stride).squeeze(1)
 
             # Loss on downsampled version
             multiscale_loss = criterion(rendered_small, target_small)
@@ -991,8 +1010,8 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
 
         if diversity_weight != 0.0:
             # Compute diversity loss (entropy of character usage, excluding whitespace)
-            weights = torch.softmax(logits, dim=-1)  # (GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
-            char_usage = weights.mean(dim=[0, 1])  # (NUM_CHARS,) - average usage of each character
+            weights = torch.softmax(logits, dim=-1)  # (B, GRID_HEIGHT, GRID_WIDTH, NUM_CHARS)
+            char_usage = weights.mean(dim=[0, 1, 2])  # (NUM_CHARS,) - average usage across batch and spatial dims
 
             # Exclude whitespace from diversity calculation
             space_idx = CHARS.index(' ') if ' ' in CHARS else -1
@@ -1017,10 +1036,11 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         if optimize_alignment and warp_reg_weight != 0.0:
             # Penalize differences between neighboring control points (Total Variation)
             # This allows uniform shifts but penalizes distortion
-            dx_tx = (tx_warp[:, 1:] - tx_warp[:, :-1]) ** 2  # horizontal differences in tx
-            dy_tx = (tx_warp[1:, :] - tx_warp[:-1, :]) ** 2  # vertical differences in tx
-            dx_ty = (ty_warp[:, 1:] - ty_warp[:, :-1]) ** 2  # horizontal differences in ty
-            dy_ty = (ty_warp[1:, :] - ty_warp[:-1, :]) ** 2  # vertical differences in ty
+            # tx_warp/ty_warp are (B, GRID_HEIGHT+1, GRID_WIDTH+1)
+            dx_tx = (tx_warp[:, :, 1:] - tx_warp[:, :, :-1]) ** 2  # horizontal differences
+            dy_tx = (tx_warp[:, 1:, :] - tx_warp[:, :-1, :]) ** 2  # vertical differences
+            dx_ty = (ty_warp[:, :, 1:] - ty_warp[:, :, :-1]) ** 2
+            dy_ty = (ty_warp[:, 1:, :] - ty_warp[:, :-1, :]) ** 2
             warp_reg_loss = dx_tx.mean() + dy_tx.mean() + dx_ty.mean() + dy_ty.mean()
         else:
             warp_reg_loss = torch.tensor(0.0).to(DEVICE)
@@ -1028,24 +1048,39 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         # Gentle regularization on global alignment parameters (prefer identity transform)
         if optimize_alignment:
             alignment_reg_weight = 0.001
-            alignment_reg_loss = (translation_x ** 2 + translation_y ** 2 +
-                                 scale_x_param ** 2 + scale_y_param ** 2 +
+            alignment_reg_loss = ((translation_x ** 2).mean() + (translation_y ** 2).mean() +
+                                 (scale_x_param ** 2).mean() + (scale_y_param ** 2).mean() +
                                  (tx_warp ** 2).mean() + (ty_warp ** 2).mean())
         else:
             alignment_reg_loss = torch.tensor(0.0).to(DEVICE)
 
-        # Temporal regularization: alignment params should be similar to previous frame
-        # Use the actual scaled values, not raw parameters
-        if optimize_alignment and prev_alignment_params is not None and temporal_weight > 0:
-            prev_tx_base, prev_ty_base, prev_tx_warp, prev_ty_warp, prev_sx, prev_sy = prev_alignment_params
-            temporal_loss = (
-                ((tx_base - prev_tx_base) ** 2).mean() +
-                ((ty_base - prev_ty_base) ** 2).mean() +
-                ((tx_warp - prev_tx_warp) ** 2).mean() +
-                ((ty_warp - prev_ty_warp) ** 2).mean() +
-                ((sx - prev_sx) ** 2).mean() +
-                ((sy - prev_sy) ** 2).mean()
-            )
+        # Temporal regularization: alignment params should be similar between adjacent frames
+        if optimize_alignment and temporal_weight > 0:
+            temporal_loss = torch.tensor(0.0, device=DEVICE)
+
+            # Within-batch: consecutive frames
+            if B > 1:
+                temporal_loss = (
+                    ((tx_base[1:] - tx_base[:-1]) ** 2).mean() +
+                    ((ty_base[1:] - ty_base[:-1]) ** 2).mean() +
+                    ((tx_warp[1:] - tx_warp[:-1]) ** 2).mean() +
+                    ((ty_warp[1:] - ty_warp[:-1]) ** 2).mean() +
+                    ((sx[1:] - sx[:-1]) ** 2).mean() +
+                    ((sy[1:] - sy[:-1]) ** 2).mean()
+                )
+
+            # Cross-batch: first frame of this batch to last frame of prev batch
+            if prev_alignment_params is not None:
+                prev_tx_base, prev_ty_base, prev_tx_warp, prev_ty_warp, prev_sx, prev_sy = prev_alignment_params
+                cross_batch_loss = (
+                    ((tx_base[0] - prev_tx_base) ** 2).mean() +
+                    ((ty_base[0] - prev_ty_base) ** 2).mean() +
+                    ((tx_warp[0] - prev_tx_warp) ** 2).mean() +
+                    ((ty_warp[0] - prev_ty_warp) ** 2).mean() +
+                    ((sx[0] - prev_sx) ** 2).mean() +
+                    ((sy[0] - prev_sy) ** 2).mean()
+                )
+                temporal_loss = temporal_loss + cross_batch_loss
         else:
             temporal_loss = torch.tensor(0.0).to(DEVICE)
 
@@ -1075,42 +1110,45 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
             postfix['div'] = f'{diversity_loss.item():.4f}'
         if optimize_alignment and warp_reg_weight != 0.0:
             postfix['w_reg'] = f'{warp_reg_loss.item():.4f}'
-        if temporal_weight > 0 and prev_alignment_params is not None:
+        if temporal_weight > 0 and B > 1:
             postfix['temp_reg'] = f'{temporal_loss.item():.4f}'
         if optimize_alignment:
-            # Show global base translation and mean warp
-            postfix['tx_base'] = f'{tx_base.item():.1f}'
-            postfix['ty_base'] = f'{ty_base.item():.1f}'
+            # Show global base translation and mean warp (averaged across batch)
+            postfix['tx_base'] = f'{tx_base.mean().item():.1f}'
+            postfix['ty_base'] = f'{ty_base.mean().item():.1f}'
             postfix['warp'] = f'{tx_warp.abs().mean().item():.1f}'
-            postfix['sx'] = f'{sx.item():.3f}'
-            postfix['sy'] = f'{sy.item():.3f}'
+            postfix['sx'] = f'{sx.mean().item():.3f}'
+            postfix['sy'] = f'{sy.mean().item():.3f}'
         pbar.set_postfix(postfix)
 
-        # Save intermediate results
-        if iteration % save_interval == 0 or iteration == num_iterations - 1:
-            save_result(
-                logits,
-                char_bitmaps,
-                output_path=f"steps/i_iter_{iteration:04d}.png",
-                text_path=f"steps/t_iter_{iteration:04d}.txt",
-                temperature=temperature,
-                target_image=target_shifted if optimize_alignment else None,
-                warp_params={'tx_warp': tx_warp, 'ty_warp': ty_warp, 'tx_base': tx_base.item(), 'ty_base': ty_base.item()} if optimize_alignment else None,
-                dark_mode=dark_mode
-            )
+        # Save intermediate results - loop through each frame in batch
+        if save_interval > 0:
+            if iteration % save_interval == 0 or iteration == num_iterations - 1:
+                for b in range(B):
+                    save_result(
+                        logits[b],
+                        char_bitmaps,
+                        output_path=f"steps/i_iter_{iteration:04d}_f{b:04d}.png",
+                        text_path=f"steps/t_iter_{iteration:04d}_f{b:04d}.txt",
+                        temperature=temperature,
+                        target_image=target_shifted[b] if optimize_alignment else None,
+                        warp_params={'tx_warp': tx_warp[b], 'ty_warp': ty_warp[b], 'tx_base': tx_base[b].item(), 'ty_base': ty_base[b].item()} if optimize_alignment else None,
+                        dark_mode=dark_mode
+                    )
 
+    # Return batched results and all alignment params
     if optimize_alignment:
-        # Pack alignment data into dict
-        alignment_data = {
-            'tx_base': tx_base.item(),
-            'ty_base': ty_base.item(),
-            'target_shifted': target_shifted,
-            'tx_warp': tx_warp,
-            'ty_warp': ty_warp,
-            'sx': sx,
-            'sy': sy
+        # Return all alignment params for all frames: (B, ...)
+        alignment_params = {
+            'tx_base': tx_base.detach(),  # (B,)
+            'ty_base': ty_base.detach(),  # (B,)
+            'tx_warp': tx_warp.detach(),  # (B, GRID_HEIGHT+1, GRID_WIDTH+1)
+            'ty_warp': ty_warp.detach(),  # (B, GRID_HEIGHT+1, GRID_WIDTH+1)
+            'sx': sx.detach(),  # (B,)
+            'sy': sy.detach(),  # (B,)
+            'target_shifted': target_shifted.detach()  # (B, H, W)
         }
-        return logits, alignment_data
+        return logits, alignment_params
     else:
         return logits, None
 
@@ -1138,7 +1176,9 @@ def save_result(logits, char_bitmaps, output_path="output.png", text_path="outpu
                 f2.write(f1.read())
 
     # Render with soft selection (no Gumbel noise for deterministic output)
-    rendered = render_ascii(logits, char_bitmaps, temperature=temperature, use_gumbel=False)
+    # render_ascii expects batched input, so add batch dim
+    rendered = render_ascii(logits.unsqueeze(0), char_bitmaps, temperature=temperature, use_gumbel=False)
+    rendered = rendered.squeeze(0)  # Remove batch dim
 
     # Invert for dark mode display
     if dark_mode:
@@ -1251,7 +1291,7 @@ Examples:
     parser.add_argument('--printer-y-offset', type=int, default=4,
                        help='Y offset for printer font rendering (default: 4)')
     parser.add_argument('--fallback-font', type=str,
-                       default='/System/Library/Fonts/Supplemental/Menlo.ttc',
+                       default='/System/Library/Fonts/Menlo.ttc',
                        help='Path to fallback font for extended ASCII')
     parser.add_argument('--fallback-font-size', type=int, default=18,
                        help='Fallback font size in points (default: 18)')
@@ -1307,6 +1347,8 @@ Examples:
                        help='Path to text file containing list of frame paths for animation mode')
     parser.add_argument('--animation-temporal-weight', type=float, default=1.0,
                        help='Weight for temporal regularization (alignment params similar to previous frame)')
+    parser.add_argument('--animation-batch-size', type=int, default=None,
+                       help='Process animation in batches of this size (default: process all frames at once)')
 
     args = parser.parse_args()
 
@@ -1426,6 +1468,8 @@ if __name__ == "__main__":
         else:
             target_image = load_target_image(image_path, keep_rgb=False)
 
+        print(f"Target image shape: {target_image.shape}")
+
         if optimize_contrast:
             target_image, contrast_curve = optimize_contrast_curve_field(target_image)
             if plot_contrast:
@@ -1463,72 +1507,96 @@ if __name__ == "__main__":
 
     # Animation mode or single image mode
     if args.animation:
-        # Animation mode: process multiple frames (no pre-optimization)
+        # Animation mode: process frames in batches
         with open(args.animation, 'r') as f:
             frame_paths = [line.strip() for line in f if line.strip()]
 
-        print(f"\nAnimation mode: processing {len(frame_paths)} frames")
+        total_frames = len(frame_paths)
+        batch_size = args.animation_batch_size if args.animation_batch_size else total_frames
+        num_batches = (total_frames + batch_size - 1) // batch_size
+
+        print(f"\nAnimation mode: processing {total_frames} frames")
+        print(f"Batch size: {batch_size} (splitting into {num_batches} batch(es))")
         print(f"Temporal regularization weight: {args.animation_temporal_weight}")
         print("Note: RGB/contrast optimization disabled")
 
         # Create frames directory
         os.makedirs("frames", exist_ok=True)
 
+        # Process each batch
         prev_alignment_params = None
+        frame_idx = 0
 
-        for frame_idx, frame_path in enumerate(frame_paths):
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, total_frames)
+            batch_paths = frame_paths[start_idx:end_idx]
+
             print(f"\n{'='*70}")
-            print(f"Frame {frame_idx + 1}/{len(frame_paths)}: {frame_path}")
+            print(f"Batch {batch_idx + 1}/{num_batches}: frames {start_idx}-{end_idx - 1} ({len(batch_paths)} frames)")
             print(f"{'='*70}")
 
-            # Load frame without pre-optimization
-            target_image = load_target_image(frame_path, keep_rgb=False)
+            # Load batch frames into batched tensor
+            print("Loading batch frames...")
+            frame_list = []
+            for frame_path in tqdm(batch_paths):
+                frame = load_target_image(frame_path, keep_rgb=False)
+                frame_list.append(frame)
 
-            # Train on this frame with temporal regularization
+            # Stack into batch: (B, H, W)
+            target_images = torch.stack(frame_list, dim=0)
+            print(f"Loaded {target_images.shape[0]} frames, shape: {target_images.shape}")
+
+            # Train on batch with temporal regularization
             train_kwargs = base_train_kwargs.copy()
-            train_kwargs['prev_alignment_params'] = prev_alignment_params
             train_kwargs['temporal_weight'] = args.animation_temporal_weight
+            train_kwargs['prev_alignment_params'] = prev_alignment_params
 
-            logits, alignment_data = train(target_image, char_bitmaps, **train_kwargs)
+            logits, alignment_params = train(target_images, char_bitmaps, **train_kwargs)
 
-            # Extract alignment data for next frame
-            if alignment_data is not None:
-                target_shifted = alignment_data['target_shifted']
-                warp_params = {
-                    'tx_warp': alignment_data['tx_warp'],
-                    'ty_warp': alignment_data['ty_warp'],
-                    'tx_base': alignment_data['tx_base'],
-                    'ty_base': alignment_data['ty_base']
-                }
-                # Save for next frame's temporal regularization
+            # Save each frame from the batch
+            print("\nSaving batch frames...")
+            for b in range(logits.shape[0]):
+                # Extract alignment params for this frame if available
+                if alignment_params is not None:
+                    warp_params = {
+                        'tx_warp': alignment_params['tx_warp'][b],
+                        'ty_warp': alignment_params['ty_warp'][b],
+                        'tx_base': alignment_params['tx_base'][b].item(),
+                        'ty_base': alignment_params['ty_base'][b].item()
+                    }
+                    target_shifted = alignment_params['target_shifted'][b]
+                else:
+                    warp_params = None
+                    target_shifted = None
+
+                save_result(
+                    logits[b], char_bitmaps,
+                    output_path=f"frames/{frame_idx:04d}.png",
+                    text_path=f"frames/enc_{frame_idx:04d}.txt",
+                    utf8_path=f"frames/{frame_idx:04d}.txt",
+                    temperature=args.save_temp,
+                    target_image=target_shifted,
+                    warp_params=warp_params,
+                    dark_mode=args.dark_mode
+                )
+                frame_idx += 1
+
+            # Extract alignment params from last frame of batch for next batch
+            if alignment_params is not None and batch_idx < num_batches - 1:
                 prev_alignment_params = (
-                    torch.tensor(alignment_data['tx_base'], device=DEVICE),
-                    torch.tensor(alignment_data['ty_base'], device=DEVICE),
-                    alignment_data['tx_warp'].detach().clone(),
-                    alignment_data['ty_warp'].detach().clone(),
-                    alignment_data['sx'].detach().clone(),
-                    alignment_data['sy'].detach().clone()
+                    alignment_params['tx_base'][-1],
+                    alignment_params['ty_base'][-1],
+                    alignment_params['tx_warp'][-1],
+                    alignment_params['ty_warp'][-1],
+                    alignment_params['sx'][-1],
+                    alignment_params['sy'][-1]
                 )
             else:
-                target_shifted = None
-                warp_params = None
-
-            # Save frame
-            frame_text_path = f"frames/{frame_idx:04d}.txt"
-            save_result(
-                logits, char_bitmaps,
-                output_path=f"frames/{frame_idx:04d}.png",
-                text_path=frame_text_path,
-                utf8_path="",
-                temperature=args.save_temp,
-                target_image=target_shifted,
-                warp_params=warp_params,
-                dark_mode=args.dark_mode
-            )
-            print(f"Saved frame to {frame_text_path}")
+                prev_alignment_params = None
 
         print(f"\n{'='*70}")
-        print(f"Animation complete! {len(frame_paths)} frames saved to frames/")
+        print(f"Animation complete! {total_frames} frames saved to frames/")
         print(f"{'='*70}")
 
     else:
@@ -1540,20 +1608,25 @@ if __name__ == "__main__":
             plot_contrast=True
         )
 
-        logits, alignment_data = train(target_image, char_bitmaps, **base_train_kwargs)
+        # Add batch dimension for single image (B=1)
+        target_image = target_image.unsqueeze(0)  # (1, H, W)
 
-        if alignment_data is not None:
-            print(f"\nLearned global translation: x={alignment_data['tx_base']:.2f}px, y={alignment_data['ty_base']:.2f}px (+ per-control-point warping)")
-            target_shifted = alignment_data['target_shifted']
+        logits, alignment_params = train(target_image, char_bitmaps, **base_train_kwargs)
+
+        # Extract single frame from batch
+        logits = logits[0]
+
+        if alignment_params is not None:
             warp_params = {
-                'tx_warp': alignment_data['tx_warp'],
-                'ty_warp': alignment_data['ty_warp'],
-                'tx_base': alignment_data['tx_base'],
-                'ty_base': alignment_data['ty_base']
+                'tx_warp': alignment_params['tx_warp'][0],
+                'ty_warp': alignment_params['ty_warp'][0],
+                'tx_base': alignment_params['tx_base'][0].item(),
+                'ty_base': alignment_params['ty_base'][0].item()
             }
+            target_shifted = alignment_params['target_shifted'][0]
         else:
-            target_shifted = None
             warp_params = None
+            target_shifted = None
 
         save_result(
             logits, char_bitmaps,

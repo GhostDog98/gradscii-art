@@ -862,7 +862,8 @@ def render_ascii(logits, char_bitmaps, temperature=1.0, use_gumbel=False):
 
 def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interval=100, warmup_iterations=50, diversity_weight=0.01,
           use_gumbel=True, temp_start=1.0, temp_end=0.01, protect_whitespace=True, multiscale_weight=0.0, multiscale_kernel=4,
-          optimize_alignment=False, alignment_lr=0.01, warp_reg_weight=0.01, dark_mode=False):
+          optimize_alignment=False, alignment_lr=0.01, warp_reg_weight=0.01, dark_mode=False,
+          prev_alignment_params=None, temporal_weight=0.0):
     """Train ASCII art using gradient descent with cosine learning rate schedule, diversity loss, multiscale perceptual loss, learnable spatial alignment, and Gumbel-softmax."""
 
     # Clear and create steps directory
@@ -892,7 +893,7 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
 
         optimizer = optim.AdamW([
             {'params': [logits], 'lr': lr},
-            {'params': [translation_x, translation_y, control_tx, control_ty, scale_x_param, scale_y_param], 'lr': alignment_lr}
+            {'params': [control_tx, control_ty], 'lr': alignment_lr}
         ])
     else:
         translation_x = None
@@ -1028,12 +1029,33 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
         if optimize_alignment:
             alignment_reg_weight = 0.001
             alignment_reg_loss = (translation_x ** 2 + translation_y ** 2 +
-                                 scale_x_param ** 2 + scale_y_param ** 2)
+                                 scale_x_param ** 2 + scale_y_param ** 2 +
+                                 (tx_warp ** 2).mean() + (ty_warp ** 2).mean())
         else:
             alignment_reg_loss = torch.tensor(0.0).to(DEVICE)
 
+        # Temporal regularization: alignment params should be similar to previous frame
+        # Use the actual scaled values, not raw parameters
+        if optimize_alignment and prev_alignment_params is not None and temporal_weight > 0:
+            prev_tx_base, prev_ty_base, prev_tx_warp, prev_ty_warp, prev_sx, prev_sy = prev_alignment_params
+            temporal_loss = (
+                ((tx_base - prev_tx_base) ** 2).mean() +
+                ((ty_base - prev_ty_base) ** 2).mean() +
+                ((tx_warp - prev_tx_warp) ** 2).mean() +
+                ((ty_warp - prev_ty_warp) ** 2).mean() +
+                ((sx - prev_sx) ** 2).mean() +
+                ((sy - prev_sy) ** 2).mean()
+            )
+        else:
+            temporal_loss = torch.tensor(0.0).to(DEVICE)
+
         # Total loss
-        loss = recon_loss + multiscale_weight * multiscale_loss + diversity_weight * diversity_loss + warp_reg_weight * warp_reg_loss + alignment_reg_loss
+        loss = (recon_loss
+            + multiscale_weight * multiscale_loss
+            + diversity_weight * diversity_loss
+            + warp_reg_weight * warp_reg_loss
+            + alignment_reg_loss
+            + temporal_weight * temporal_loss)
 
         # Backprop
         loss.backward()
@@ -1053,6 +1075,8 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
             postfix['div'] = f'{diversity_loss.item():.4f}'
         if optimize_alignment and warp_reg_weight != 0.0:
             postfix['w_reg'] = f'{warp_reg_loss.item():.4f}'
+        if temporal_weight > 0 and prev_alignment_params is not None:
+            postfix['temp_reg'] = f'{temporal_loss.item():.4f}'
         if optimize_alignment:
             # Show global base translation and mean warp
             postfix['tx_base'] = f'{tx_base.item():.1f}'
@@ -1076,10 +1100,19 @@ def train(target_image, char_bitmaps, num_iterations=1000, lr=0.01, save_interva
             )
 
     if optimize_alignment:
-        # Return global base translation and warp field
-        return logits, tx_base.item(), ty_base.item(), target_shifted, tx_warp, ty_warp
+        # Pack alignment data into dict
+        alignment_data = {
+            'tx_base': tx_base.item(),
+            'ty_base': ty_base.item(),
+            'target_shifted': target_shifted,
+            'tx_warp': tx_warp,
+            'ty_warp': ty_warp,
+            'sx': sx,
+            'sy': sy
+        }
+        return logits, alignment_data
     else:
-        return logits
+        return logits, None
 
 
 def save_result(logits, char_bitmaps, output_path="output.png", text_path="output.txt", utf8_path="", temperature=0.1, target_image=None, warp_params=None, dark_mode=False):
@@ -1183,8 +1216,8 @@ Examples:
         """
     )
 
-    # Required arguments
-    parser.add_argument('input_image', help='Input image path')
+    # Input arguments (one of input_image or --animation required)
+    parser.add_argument('input_image', nargs='?', help='Input image path (not needed for animation mode)')
 
     # Preset configuration
     parser.add_argument('--preset', choices=['epson', 'discord'],
@@ -1270,12 +1303,18 @@ Examples:
                        help='Output text file path (default: output.txt)')
     parser.add_argument('--output-utf8', type=str, default='output.utf8.txt',
                        help='Output UTF-8 text file path (default: output.utf8.txt)')
-
-    # Test mode
-    parser.add_argument('--test-chars', action='store_true',
-                       help='Test character rendering and exit')
+    parser.add_argument('--animation', type=str,
+                       help='Path to text file containing list of frame paths for animation mode')
+    parser.add_argument('--animation-temporal-weight', type=float, default=1.0,
+                       help='Weight for temporal regularization (alignment params similar to previous frame)')
 
     args = parser.parse_args()
+
+    # Validate input: need either input_image or --animation
+    if not args.input_image and not args.animation:
+        parser.error("Either input_image or --animation must be provided")
+    if args.input_image and args.animation:
+        parser.error("Cannot specify both input_image and --animation")
 
     # Apply presets
     if args.preset == 'epson':
@@ -1378,61 +1417,153 @@ if __name__ == "__main__":
     print("=" * 70)
     print()
 
+    # Helper functions
+    def preprocess_image(image_path, optimize_rgb, optimize_contrast, plot_contrast=False):
+        """Load and preprocess image with optional RGB and contrast optimization."""
+        if optimize_rgb:
+            target_image_rgb = load_target_image(image_path, keep_rgb=True)
+            target_image, rgb_model = optimize_rgb_curves(target_image_rgb)
+        else:
+            target_image = load_target_image(image_path, keep_rgb=False)
+
+        if optimize_contrast:
+            target_image, contrast_curve = optimize_contrast_curve_field(target_image)
+            if plot_contrast:
+                plot_curve_ascii(contrast_curve)
+
+        return target_image
+
+    def make_train_kwargs(args, prev_alignment_params=None, temporal_weight=0.0):
+        """Construct kwargs dict for train() based on args."""
+        return {
+            'num_iterations': args.iterations,
+            'lr': args.lr,
+            'save_interval': args.save_interval,
+            'warmup_iterations': args.warmup,
+            'diversity_weight': args.diversity_weight,
+            'use_gumbel': not args.no_gumbel,
+            'temp_start': args.temp_start,
+            'temp_end': args.temp_end,
+            'protect_whitespace': not args.penalize_whitespace,
+            'multiscale_weight': args.multiscale_weight,
+            'multiscale_kernel': args.multiscale_kernel,
+            'optimize_alignment': args.optimize_alignment,
+            'alignment_lr': args.alignment_lr,
+            'warp_reg_weight': args.warp_reg_weight,
+            'dark_mode': args.dark_mode,
+            'prev_alignment_params': prev_alignment_params,
+            'temporal_weight': temporal_weight
+        }
+
     # Training mode
     char_bitmaps = create_char_bitmaps()
 
-    # Load image (RGB if optimizing RGB curves, else grayscale)
-    if args.optimize_rgb_to_gray:
-        target_image_rgb = load_target_image(args.input_image, keep_rgb=True)
-        target_image, rgb_curves = optimize_rgb_curves(target_image_rgb)
-        # Optionally also optimize contrast on the resulting grayscale
-        if args.optimize_contrast:
-            target_image, contrast_curve = optimize_contrast_curve_field(target_image)
-            plot_curve_ascii(contrast_curve)
+    # Construct base training kwargs (same for all frames in animation)
+    base_train_kwargs = make_train_kwargs(args)
+
+    # Animation mode or single image mode
+    if args.animation:
+        # Animation mode: process multiple frames (no pre-optimization)
+        with open(args.animation, 'r') as f:
+            frame_paths = [line.strip() for line in f if line.strip()]
+
+        print(f"\nAnimation mode: processing {len(frame_paths)} frames")
+        print(f"Temporal regularization weight: {args.animation_temporal_weight}")
+        print("Note: RGB/contrast optimization disabled")
+
+        # Create frames directory
+        os.makedirs("frames", exist_ok=True)
+
+        prev_alignment_params = None
+
+        for frame_idx, frame_path in enumerate(frame_paths):
+            print(f"\n{'='*70}")
+            print(f"Frame {frame_idx + 1}/{len(frame_paths)}: {frame_path}")
+            print(f"{'='*70}")
+
+            # Load frame without pre-optimization
+            target_image = load_target_image(frame_path, keep_rgb=False)
+
+            # Train on this frame with temporal regularization
+            train_kwargs = base_train_kwargs.copy()
+            train_kwargs['prev_alignment_params'] = prev_alignment_params
+            train_kwargs['temporal_weight'] = args.animation_temporal_weight
+
+            logits, alignment_data = train(target_image, char_bitmaps, **train_kwargs)
+
+            # Extract alignment data for next frame
+            if alignment_data is not None:
+                target_shifted = alignment_data['target_shifted']
+                warp_params = {
+                    'tx_warp': alignment_data['tx_warp'],
+                    'ty_warp': alignment_data['ty_warp'],
+                    'tx_base': alignment_data['tx_base'],
+                    'ty_base': alignment_data['ty_base']
+                }
+                # Save for next frame's temporal regularization
+                prev_alignment_params = (
+                    torch.tensor(alignment_data['tx_base'], device=DEVICE),
+                    torch.tensor(alignment_data['ty_base'], device=DEVICE),
+                    alignment_data['tx_warp'].detach().clone(),
+                    alignment_data['ty_warp'].detach().clone(),
+                    alignment_data['sx'].detach().clone(),
+                    alignment_data['sy'].detach().clone()
+                )
+            else:
+                target_shifted = None
+                warp_params = None
+
+            # Save frame
+            frame_text_path = f"frames/{frame_idx:04d}.txt"
+            save_result(
+                logits, char_bitmaps,
+                output_path=f"frames/{frame_idx:04d}.png",
+                text_path=frame_text_path,
+                utf8_path="",
+                temperature=args.save_temp,
+                target_image=target_shifted,
+                warp_params=warp_params,
+                dark_mode=args.dark_mode
+            )
+            print(f"Saved frame to {frame_text_path}")
+
+        print(f"\n{'='*70}")
+        print(f"Animation complete! {len(frame_paths)} frames saved to frames/")
+        print(f"{'='*70}")
+
     else:
-        target_image = load_target_image(args.input_image, keep_rgb=False)
-        # Optimize contrast curve if requested
-        if args.optimize_contrast:
-            target_image, contrast_curve = optimize_contrast_curve_field(target_image)
-            plot_curve_ascii(contrast_curve)
+        # Single image mode with pre-optimization
+        target_image = preprocess_image(
+            args.input_image,
+            optimize_rgb=args.optimize_rgb_to_gray,
+            optimize_contrast=args.optimize_contrast,
+            plot_contrast=True
+        )
 
-    result = train(
-        target_image, char_bitmaps,
-        num_iterations=args.iterations,
-        lr=args.lr,
-        save_interval=args.save_interval,
-        warmup_iterations=args.warmup,
-        diversity_weight=args.diversity_weight,
-        use_gumbel=not args.no_gumbel,
-        temp_start=args.temp_start,
-        temp_end=args.temp_end,
-        protect_whitespace=not args.penalize_whitespace,
-        multiscale_weight=args.multiscale_weight,
-        multiscale_kernel=args.multiscale_kernel,
-        optimize_alignment=args.optimize_alignment,
-        alignment_lr=args.alignment_lr,
-        warp_reg_weight=args.warp_reg_weight,
-        dark_mode=args.dark_mode
-    )
+        logits, alignment_data = train(target_image, char_bitmaps, **base_train_kwargs)
 
-    if args.optimize_alignment:
-        logits, tx_base, ty_base, target_shifted, tx_warp, ty_warp = result
-        print(f"\nLearned global translation: x={tx_base:.2f}px, y={ty_base:.2f}px (+ per-control-point warping)")
-        warp_params = {'tx_warp': tx_warp, 'ty_warp': ty_warp, 'tx_base': tx_base, 'ty_base': ty_base}
-    else:
-        logits = result
-        target_shifted = None
-        warp_params = None
+        if alignment_data is not None:
+            print(f"\nLearned global translation: x={alignment_data['tx_base']:.2f}px, y={alignment_data['ty_base']:.2f}px (+ per-control-point warping)")
+            target_shifted = alignment_data['target_shifted']
+            warp_params = {
+                'tx_warp': alignment_data['tx_warp'],
+                'ty_warp': alignment_data['ty_warp'],
+                'tx_base': alignment_data['tx_base'],
+                'ty_base': alignment_data['ty_base']
+            }
+        else:
+            target_shifted = None
+            warp_params = None
 
-    save_result(
-        logits, char_bitmaps,
-        output_path=args.output,
-        text_path=args.output_text,
-        utf8_path=args.output_utf8,
-        temperature=args.save_temp,
-        target_image=target_shifted,
-        warp_params=warp_params,
-        dark_mode=args.dark_mode
-    )
+        save_result(
+            logits, char_bitmaps,
+            output_path=args.output,
+            text_path=args.output_text,
+            utf8_path=args.output_utf8,
+            temperature=args.save_temp,
+            target_image=target_shifted,
+            warp_params=warp_params,
+            dark_mode=args.dark_mode
+        )
 
     print("\nDone!")

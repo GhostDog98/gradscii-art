@@ -37,8 +37,9 @@ def test_all_chars_grid():
     one_hot = torch.zeros((GRID_HEIGHT, GRID_WIDTH, NUM_CHARS), device=DEVICE)
     one_hot.scatter_(-1, char_indices_tensor.unsqueeze(-1), 1.0)
 
-    # Render
-    rendered = render_ascii(one_hot, char_bitmaps, temperature=0.01, use_gumbel=False)
+    # Render (render_ascii expects batched input, so add batch dim)
+    rendered = render_ascii(one_hot.unsqueeze(0), char_bitmaps, temperature=0.01, use_gumbel=False)
+    rendered = rendered.squeeze(0)  # Remove batch dim
 
     # Save
     img_array = (rendered.detach().cpu().numpy() * 255).astype(np.uint8)

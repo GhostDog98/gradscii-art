@@ -8,6 +8,28 @@ Is it overkill? Yes but fuck it we ball
 
 ## Gallery
 
+### [Bad Apple](https://x.com/gf_256/status/2015012967427854573)
+
+EXPERIENCE IT LIVE:
+
+```
+telnet bad.apple.zellic.io
+
+-= or =-
+
+nc bad.apple.zellic.io 23
+
+-= or =-
+
+ssh badapple@bad.apple.zellic.io 
+```
+
+or https://bad.apple.zellic.io
+
+YES IT SUPPORTS ANIMATIONS WITH TEMPORAL REGULARIZATION LOSS
+
+---
+
 ![Receipt printer output](./examples/IMG_3591.jpg)
 
 ![Receipt printer output](./examples/IMG_3592.jpg)

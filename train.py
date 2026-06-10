@@ -1273,7 +1273,9 @@ Examples:
     parser.add_argument('--grid-height', type=int, default=21,
                        help='Number of character rows (default: 21)')
     parser.add_argument('--preserve-ar', type=float, default=None,
-                       help='Automatically calculate grid dimensions to preserve image aspect ratio. Argument specifies scale factor for minimum dimension (e.g., 1159x1828 image = 80x63 minimum, scale=1.5 gives 120x95)')
+                       help='Automatically calculate grid dimensions to preserve image aspect ratio. Overrides --grid-width and --grid-height (default: None)')
+    parser.add_argument('--ar-epsilon', type=float, default=0.005,
+                       help='Aspect ratio tolerance (as fraction, e.g., 0.02 = 2%% error) for grid dimension adjustment (default: 0.005)')
     parser.add_argument('--row-gap', type=int, default=6,
                        help='Gap between rows in pixels (default: 6 for receipt printer, 0 for Discord)')
 
@@ -1410,21 +1412,55 @@ if __name__ == "__main__":
         min_grid_height = img_height / CHAR_HEIGHT
         min_grid = min(min_grid_width, min_grid_height)
         
-        # Apply scaling factor
+        # Apply scaling factor as starting point
+        target_ratio = img_width / img_height
         GRID_WIDTH = int(min_grid * args.preserve_ar)
         
-        # Calculate GRID_HEIGHT preserving aspect ratio
-        # Formula: grid_height = (grid_width * char_width * img_height) / (char_height * img_width)
-        GRID_HEIGHT = int((GRID_WIDTH * CHAR_WIDTH * img_height) / (CHAR_HEIGHT * img_width))
+        # Helper function to calculate best GRID_HEIGHT for a given GRID_WIDTH
+        def find_best_height(gw):
+            grid_height_exact = (gw * CHAR_WIDTH * img_height) / (CHAR_HEIGHT * img_width)
+            grid_height_floor = int(grid_height_exact)
+            grid_height_ceil = grid_height_floor + 1
+            
+            ratio_floor = (gw * CHAR_WIDTH) / (grid_height_floor * CHAR_HEIGHT)
+            ratio_ceil = (gw * CHAR_WIDTH) / (grid_height_ceil * CHAR_HEIGHT)
+            
+            error_floor = abs(ratio_floor - target_ratio) / target_ratio
+            error_ceil = abs(ratio_ceil - target_ratio) / target_ratio
+            
+            if error_floor < error_ceil:
+                return grid_height_floor, error_floor
+            else:
+                return grid_height_ceil, error_ceil
+        
+        # Try to find grid dimensions within epsilon tolerance
+        GRID_HEIGHT, chosen_error = find_best_height(GRID_WIDTH)
+        
+        # If error exceeds epsilon, incrementally try larger widths (up to 50% larger)
+        max_width = int(GRID_WIDTH * 1.5)
+        while chosen_error > args.ar_epsilon and GRID_WIDTH < max_width:
+            GRID_WIDTH += 1
+            GRID_HEIGHT, new_error = find_best_height(GRID_WIDTH)
+            if new_error < chosen_error:
+                chosen_error = new_error
+            else:
+                # Error got worse, revert
+                GRID_WIDTH -= 1
+                break
         
         # Ensure both are at least 1
         GRID_WIDTH = max(1, GRID_WIDTH)
         GRID_HEIGHT = max(1, GRID_HEIGHT)
         
-        print(f"Aspect ratio preservation: scaling factor {args.preserve_ar}, calculated grid: {GRID_WIDTH}x{GRID_HEIGHT}")
+        print(f"Aspect ratio preservation: scaling factor {args.preserve_ar}")
+        print(f"  Calculated grid: {GRID_WIDTH}x{GRID_HEIGHT}")
+        print(f"  Target AR: {target_ratio:.4f}, Actual AR: {(GRID_WIDTH*CHAR_WIDTH)/(GRID_HEIGHT*CHAR_HEIGHT):.4f}, Error: {chosen_error*100:.2f}%")
+        if chosen_error > args.ar_epsilon:
+            print(f"  Warning: Aspect ratio error ({chosen_error*100:.2f}%) exceeds epsilon tolerance ({args.ar_epsilon*100:.2f}%)")
 
     IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH
     IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT + ROW_GAP * (GRID_HEIGHT - 1)
+
 
     # Initialize warp interpolation cache for spatial alignment
     WARP_INTERP_CACHE = precompute_warp_interpolation_structure(IMAGE_HEIGHT, IMAGE_WIDTH)

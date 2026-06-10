@@ -1272,6 +1272,8 @@ Examples:
                        help='Number of characters per row (default: 42)')
     parser.add_argument('--grid-height', type=int, default=21,
                        help='Number of character rows (default: 21)')
+    parser.add_argument('--preserve-ar', type=float, default=None,
+                       help='Automatically calculate grid dimensions to preserve image aspect ratio. Argument specifies scale factor for minimum dimension (e.g., 1159x1828 image = 80x63 minimum, scale=1.5 gives 120x95)')
     parser.add_argument('--row-gap', type=int, default=6,
                        help='Gap between rows in pixels (default: 6 for receipt printer, 0 for Discord)')
 
@@ -1391,6 +1393,36 @@ if __name__ == "__main__":
     GRID_WIDTH = args.grid_width
     GRID_HEIGHT = args.grid_height
     ROW_GAP = args.row_gap
+
+    # Calculate grid dimensions to preserve aspect ratio if requested
+    if args.preserve_ar is not None:
+        if not args.input_image:
+            print("Error: --preserve-ar requires an input image")
+            exit(1)
+        
+        # Get image dimensions
+        img = Image.open(args.input_image)
+        img_width, img_height = img.size
+        print(f"Image dimensions: {img_width}x{img_height}")
+        
+        # Calculate minimum grid dimensions
+        min_grid_width = img_width / CHAR_WIDTH
+        min_grid_height = img_height / CHAR_HEIGHT
+        min_grid = min(min_grid_width, min_grid_height)
+        
+        # Apply scaling factor
+        GRID_WIDTH = int(min_grid * args.preserve_ar)
+        
+        # Calculate GRID_HEIGHT preserving aspect ratio
+        # Formula: grid_height = (grid_width * char_width * img_height) / (char_height * img_width)
+        GRID_HEIGHT = int((GRID_WIDTH * CHAR_WIDTH * img_height) / (CHAR_HEIGHT * img_width))
+        
+        # Ensure both are at least 1
+        GRID_WIDTH = max(1, GRID_WIDTH)
+        GRID_HEIGHT = max(1, GRID_HEIGHT)
+        
+        print(f"Aspect ratio preservation: scaling factor {args.preserve_ar}, calculated grid: {GRID_WIDTH}x{GRID_HEIGHT}")
+
     IMAGE_WIDTH = CHAR_WIDTH * GRID_WIDTH
     IMAGE_HEIGHT = CHAR_HEIGHT * GRID_HEIGHT + ROW_GAP * (GRID_HEIGHT - 1)
 
